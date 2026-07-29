@@ -16,8 +16,8 @@ add(#{json := Params, auth_data := #{player_id := PlayerId}} = _Req) when
                 properties => maps:get(~"properties", Params, #{})
             },
             case asobi_matchmaker:add(PlayerId, MatchParams) of
-                {ok, TicketId} ->
-                    {json, 200, #{}, #{ticket_id => TicketId, status => ~"pending"}};
+                {ok, TicketId, Meta} ->
+                    {json, 200, #{}, Meta#{ticket_id => TicketId, status => ~"pending"}};
                 {error, queue_full} ->
                     {json, 503, #{}, #{error => ~"queue_full"}}
             end
@@ -38,7 +38,19 @@ status(
     #{bindings := #{~"ticket_id" := TicketId}, auth_data := #{player_id := PlayerId}} = _Req
 ) when is_binary(PlayerId), is_binary(TicketId) ->
     case asobi_matchmaker:get_ticket(PlayerId, TicketId) of
-        {ok, Ticket} -> {json, Ticket};
-        {error, not_owner} -> {status, 403};
-        {error, not_found} -> {status, 404}
+        {ok, Ticket} ->
+            %% Project an explicit shape rather than dumping the internal ticket
+            %% map, so internal fields (attempts, player_id) never leak to the
+            %% client. Keeps the public fields clients already read (`id`).
+            {json, #{
+                id => maps:get(id, Ticket),
+                mode => maps:get(mode, Ticket),
+                status => maps:get(status, Ticket),
+                properties => maps:get(properties, Ticket, #{}),
+                submitted_at => maps:get(submitted_at, Ticket)
+            }};
+        {error, not_owner} ->
+            {status, 403};
+        {error, not_found} ->
+            {status, 404}
     end.
