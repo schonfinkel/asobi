@@ -8,19 +8,32 @@ spawns a match, and pushes `match.matched` to each player. A single
 -behaviour(gen_server).
 
 -export([start_link/0, add/2, remove/2, get_ticket/1, get_ticket/2, get_queue_stats/0]).
+-export([known_mode/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(DEFAULT_TICK, 1000).
+-define(DEFAULT_MAX_QUEUE, 10000).
 
 -spec start_link() -> gen_server:start_ret().
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
--spec add(binary(), map()) -> {ok, binary()}.
+-spec add(binary(), map()) -> {ok, binary()} | {error, queue_full}.
 add(PlayerId, Params) ->
     case gen_server:call(?MODULE, {add, PlayerId, Params}) of
-        {ok, TicketId} when is_binary(TicketId) -> {ok, TicketId}
+        {ok, TicketId} when is_binary(TicketId) -> {ok, TicketId};
+        {error, queue_full} -> {error, queue_full}
     end.
+
+%% Whether a mode is registered (or the no-mode default). Callers reject unknown
+%% modes at the edge, so an attacker cannot inflate the queue with arbitrary
+%% mode strings that would each slip past the per-(player, mode) ticket guard.
+-spec known_mode(term()) -> boolean().
+known_mode(Mode) when is_binary(Mode) ->
+    Modes = ensure_map(application:get_env(asobi, game_modes, #{})),
+    Mode =:= ~"default" orelse is_map_key(Mode, Modes);
+known_mode(_) ->
+    false.
 
 -spec remove(binary(), binary()) -> ok | {error, not_found | not_owner}.
 remove(PlayerId, TicketId) ->
@@ -70,32 +83,50 @@ init([]) ->
             MW when is_integer(MW) -> MW;
             _ -> 60
         end,
+    MaxQueue =
+        case maps:get(max_queue, Cfg, ?DEFAULT_MAX_QUEUE) of
+            MQ when is_integer(MQ), MQ > 0 -> MQ;
+            _ -> ?DEFAULT_MAX_QUEUE
+        end,
     {ok, #{
         tickets => #{},
         tick_interval => TickInterval,
-        max_wait => MaxWaitSec * 1000
+        max_wait => MaxWaitSec * 1000,
+        max_queue => MaxQueue
     }}.
 
 -spec handle_call(term(), gen_server:from(), map()) -> {reply, term(), map()}.
 handle_call({add, PlayerId, Params}, _From, #{tickets := Tickets} = State) when
     is_binary(PlayerId), is_map(Params)
 ->
-    TicketId = generate_id(),
     Mode =
         case maps:get(mode, Params, ~"default") of
             M when is_binary(M) -> M;
             _ -> ~"default"
         end,
-    Ticket = #{
-        id => TicketId,
-        player_id => PlayerId,
-        mode => Mode,
-        properties => maps:get(properties, Params, #{}),
-        submitted_at => erlang:system_time(millisecond),
-        status => pending
-    },
-    asobi_telemetry:matchmaker_queued(PlayerId, Mode),
-    {reply, {ok, TicketId}, State#{tickets => Tickets#{TicketId => Ticket}}};
+    MaxQueue = maps:get(max_queue, State, ?DEFAULT_MAX_QUEUE),
+    %% One live ticket per (player, mode): a re-add while already queued returns
+    %% the existing ticket rather than minting a second, so a double-tapped
+    %% "find match" can't give one player two tickets that fill into a
+    %% self-match (asobi#230). A full queue is rejected before minting.
+    case find_player_ticket(PlayerId, Mode, Tickets) of
+        {ok, ExistingId} ->
+            {reply, {ok, ExistingId}, State};
+        error when map_size(Tickets) >= MaxQueue ->
+            {reply, {error, queue_full}, State};
+        error ->
+            TicketId = generate_id(),
+            Ticket = #{
+                id => TicketId,
+                player_id => PlayerId,
+                mode => Mode,
+                properties => maps:get(properties, Params, #{}),
+                submitted_at => erlang:system_time(millisecond),
+                status => pending
+            },
+            asobi_telemetry:matchmaker_queued(PlayerId, Mode),
+            {reply, {ok, TicketId}, State#{tickets => Tickets#{TicketId => Ticket}}}
+    end;
 handle_call({get_ticket, PlayerId, TicketId}, _From, #{tickets := Tickets} = State) when
     is_binary(PlayerId), is_binary(TicketId)
 ->
@@ -235,11 +266,51 @@ match_all_modes(ByMode) ->
             ModeConfig = mode_config(Mode),
             Strategy = resolve_strategy(ModeConfig),
             {M, U} = Strategy:match(ModeTickets, ModeConfig),
-            {M ++ AllMatched, [U | AllUnmatched]}
+            %% Defence in depth for any strategy, including user-supplied ones:
+            %% never spawn a match that lists the same player twice. A group
+            %% that repeats a player is dropped back to unmatched rather than
+            %% forming a degenerate (self-)match. The add-time guard means this
+            %% never fires for the built-in strategies.
+            {Valid, Requeue} = reject_duplicate_players(M),
+            {Valid ++ AllMatched, [U, Requeue | AllUnmatched]}
         end,
         {[], []},
         ByMode
     ).
+
+%% Keep groups whose players are all distinct; drop any group that repeats a
+%% player back to the queue rather than spawning a degenerate (self-)match.
+-spec reject_duplicate_players([[map()]]) -> {[[map()]], [map()]}.
+reject_duplicate_players(Groups) ->
+    reject_duplicate_players(Groups, [], []).
+
+reject_duplicate_players([], Valid, Requeue) ->
+    {Valid, Requeue};
+reject_duplicate_players([Group | Rest], Valid, Requeue) ->
+    Ids = [maps:get(player_id, T) || T <- Group],
+    case length(lists:usort(Ids)) =:= length(Ids) of
+        true ->
+            reject_duplicate_players(Rest, [Group | Valid], Requeue);
+        false ->
+            logger:error(#{
+                msg => ~"matchmaker group repeated a player; dropped to re-queue",
+                players => Ids
+            }),
+            %% Re-queue the whole group. process_tickets keys Remaining by ticket
+            %% id, so a repeated ticket collapses there and none is stranded.
+            reject_duplicate_players(Rest, Valid, Group ++ Requeue)
+    end.
+
+%% This player's live ticket for a mode, if any (backs the add idempotency guard).
+-spec find_player_ticket(binary(), binary(), map()) -> {ok, binary()} | error.
+find_player_ticket(PlayerId, Mode, Tickets) ->
+    Pred = fun({_Id, #{player_id := P, mode := M}}) ->
+        P =:= PlayerId andalso M =:= Mode
+    end,
+    case lists:search(Pred, maps:to_list(Tickets)) of
+        {value, {Id, _Ticket}} -> {ok, Id};
+        false -> error
+    end.
 
 -spec mode_config(binary()) -> map().
 mode_config(Mode) ->
@@ -460,3 +531,49 @@ ensure_map(_) -> #{}.
 
 -spec pos_len([term(), ...]) -> pos_integer().
 pos_len([_ | _] = L) -> length(L).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%% The reject seam is unreachable through the public API once the add-time guard
+%% exists, so exercise it directly (it defends against user-supplied strategies).
+reject_duplicate_players_test_() ->
+    T = fun(P) -> #{player_id => P, mode => ~"m"} end,
+    [
+        %% all-distinct group is kept, nothing re-queued
+        ?_assertEqual(
+            {[[T(~"a"), T(~"b")]], []},
+            reject_duplicate_players([[T(~"a"), T(~"b")]])
+        ),
+        %% a repeated player drops the group and re-queues the WHOLE group (the
+        %% duplicate collapses on ticket id in process_tickets - nothing stranded)
+        ?_assertEqual(
+            {[], [T(~"a"), T(~"a")]},
+            reject_duplicate_players([[T(~"a"), T(~"a")]])
+        ),
+        %% mixed: valid group kept, offending group re-queued
+        ?_assertEqual(
+            {[[T(~"a"), T(~"b")]], [T(~"c"), T(~"c")]},
+            reject_duplicate_players([[T(~"a"), T(~"b")], [T(~"c"), T(~"c")]])
+        )
+    ].
+
+known_mode_test_() ->
+    {setup,
+        fun() ->
+            Prev = application:get_env(asobi, game_modes),
+            application:set_env(asobi, game_modes, #{~"arena" => #{}}),
+            Prev
+        end,
+        fun
+            ({ok, V}) -> application:set_env(asobi, game_modes, V);
+            (undefined) -> application:unset_env(asobi, game_modes)
+        end, [
+            ?_assert(known_mode(~"default")),
+            ?_assert(known_mode(~"arena")),
+            ?_assertNot(known_mode(~"nope")),
+            ?_assertNot(known_mode(12345)),
+            ?_assertNot(known_mode(<<0, 255>>))
+        ]}.
+
+-endif.
