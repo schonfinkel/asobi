@@ -46,4 +46,19 @@ changeset(Data, Params) ->
     CS2 = kura_changeset:validate_length(CS1, name, [{min, 2}, {max, 64}]),
     %% F-17: cap description length so an attacker cannot store
     %% megabytes of text in the groups table.
-    kura_changeset:validate_length(CS2, description, [{max, 1024}]).
+    CS3 = kura_changeset:validate_length(CS2, description, [{max, 1024}]),
+    %% asobi#216: metadata is unbounded jsonb. changeset/2 is a public library
+    %% entry point (asobi_engine, self-hosters, future controllers) that casts
+    %% it - today's create_group/update_group controllers happen to strip
+    %% metadata via an explicit allowlist before calling here, but the cap
+    %% belongs on the schema, not on that filtering staying in place
+    %% (mirrors asobi_player:registration_changeset/2, #169 M3).
+    kura_changeset:validate_change(CS3, metadata, fun metadata_within_limit/1).
+
+-spec metadata_within_limit(dynamic()) -> ok | {error, binary()}.
+metadata_within_limit(Metadata) ->
+    case asobi_jsonb:check(Metadata, asobi_jsonb:default_metadata_bytes()) of
+        ok -> ok;
+        too_large -> {error, ~"must be 16 KB or less"};
+        not_encodable -> {error, ~"is not encodable"}
+    end.

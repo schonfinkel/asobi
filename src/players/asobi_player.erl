@@ -86,8 +86,6 @@ hash_password(CS) ->
             kura_changeset:put_change(CS, hashed_password, Hashed)
     end.
 
--define(MAX_METADATA_BYTES, 16384).
-
 -spec update_changeset(map(), map()) -> #kura_changeset{}.
 update_changeset(Data, Params) ->
     CS = kura_changeset:cast(?MODULE, Data, Params, [display_name, avatar_url, metadata]),
@@ -100,9 +98,8 @@ update_changeset(Data, Params) ->
 
 -spec metadata_within_limit(dynamic()) -> ok | {error, binary()}.
 metadata_within_limit(Metadata) ->
-    try iolist_size(json:encode(Metadata)) =< ?MAX_METADATA_BYTES of
-        true -> ok;
-        false -> {error, ~"must be 16 KB or less"}
-    catch
-        _:_ -> {error, ~"is not encodable"}
+    case asobi_jsonb:check(Metadata, asobi_jsonb:default_metadata_bytes()) of
+        ok -> ok;
+        too_large -> {error, ~"must be 16 KB or less"};
+        not_encodable -> {error, ~"is not encodable"}
     end.
