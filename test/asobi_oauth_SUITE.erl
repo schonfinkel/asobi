@@ -16,7 +16,9 @@
     identity_db_roundtrip/1,
     login_existing_identity/1,
     create_player_retries_on_username_collision/1,
-    create_player_no_retry_on_non_unique_username_error/1
+    create_player_no_retry_on_non_unique_username_error/1,
+    create_player_deletes_orphan_on_identity_race_loss/1,
+    create_player_identity_insert_real_failure_returns_500/1
 ]).
 
 all() ->
@@ -40,7 +42,9 @@ groups() ->
         ]},
         {create_player, [], [
             create_player_retries_on_username_collision,
-            create_player_no_retry_on_non_unique_username_error
+            create_player_no_retry_on_non_unique_username_error,
+            create_player_deletes_orphan_on_identity_race_loss,
+            create_player_identity_insert_real_failure_returns_500
         ]}
     ].
 
@@ -296,6 +300,78 @@ create_player_no_retry_on_non_unique_username_error(Config) ->
         {json, 500, _, #{error := ~"registration_failed"}} =
             asobi_oauth_controller:create_player_with_identity(~"discord", Claims),
         ?assertEqual(1, meck:num_calls(asobi_repo, insert, '_'))
+    after
+        meck:unload(asobi_repo)
+    end,
+    Config.
+
+%% asobi#241: two concurrent first-sign-ins for the same provider_uid can
+%% both insert a `players` row, but only one wins the identity insert
+%% (unique {provider, provider_uid} index). The loser must NOT be issued
+%% tokens for a player with no identity row - that player becomes an orphan
+%% no later login can ever match against. Simulate the loss by forcing the
+%% identity insert to fail inside the transaction; assert 409 and that the
+%% DB rolled the just-created player back rather than leaving it behind.
+%% The created id is captured independently of anything the code under test
+%% returns, so this can't pass by tautology (asobi#241 security review, M3).
+create_player_deletes_orphan_on_identity_race_loss(Config) ->
+    Self = self(),
+    meck:new(asobi_repo, [passthrough]),
+    meck:expect(asobi_repo, insert, fun
+        (#kura_changeset{schema = asobi_player_identity} = CS) ->
+            {error, kura_changeset:add_error(CS, provider_uid, ~"has already been taken")};
+        (#kura_changeset{schema = asobi_player} = CS) ->
+            {ok, Player} = meck:passthrough([CS]),
+            true = is_map(Player),
+            Self ! {created, maps:get(id, Player)},
+            {ok, Player};
+        (CS) ->
+            meck:passthrough([CS])
+    end),
+    try
+        ProviderUid = iolist_to_binary([
+            ~"race_uid_", integer_to_binary(erlang:unique_integer([positive]))
+        ]),
+        Claims = #{provider_uid => ProviderUid, provider_display_name => undefined},
+        ?assertEqual(
+            {json, 409, #{}, #{error => ~"already_registering"}},
+            asobi_oauth_controller:create_player_with_identity(~"discord", Claims)
+        ),
+        PlayerId =
+            receive
+                {created, Id} -> Id
+            after 1000 -> erlang:error(player_not_created)
+            end,
+        ?assertEqual({error, not_found}, asobi_repo:get(asobi_player, PlayerId))
+    after
+        meck:unload(asobi_repo)
+    end,
+    Config.
+
+%% asobi#241: an identity-insert failure that is NOT the provider_uid unique
+%% race (e.g. a validation error on another field) must not be misreported as
+%% already_registering - it logs and returns 500.
+create_player_identity_insert_real_failure_returns_500(Config) ->
+    meck:new(asobi_repo, [passthrough]),
+    meck:expect(asobi_repo, insert, fun
+        (#kura_changeset{schema = asobi_player_identity} = CS) ->
+            {error, kura_changeset:add_error(CS, provider_email, ~"is invalid")};
+        (CS) ->
+            meck:passthrough([CS])
+    end),
+    try
+        ProviderUid = iolist_to_binary([
+            ~"real_failure_uid_", integer_to_binary(erlang:unique_integer([positive]))
+        ]),
+        Claims = #{
+            provider_uid => ProviderUid,
+            provider_display_name => undefined,
+            provider_email => ~"not-an-email"
+        },
+        ?assertEqual(
+            {json, 500, #{}, #{error => ~"registration_failed"}},
+            asobi_oauth_controller:create_player_with_identity(~"discord", Claims)
+        )
     after
         meck:unload(asobi_repo)
     end,
