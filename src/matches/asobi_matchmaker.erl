@@ -29,13 +29,17 @@ add(PlayerId, Params) ->
         {error, queue_full} -> {error, queue_full}
     end.
 
-%% Whether a mode is registered (or the no-mode default). Callers reject unknown
-%% modes at the edge, so an attacker cannot inflate the queue with arbitrary
-%% mode strings that would each slip past the per-(player, mode) ticket guard.
+%% A mode must actually resolve to a game module - including the "default" a
+%% single-mode game's loader registers - not merely be a key in `game_modes'.
+%% A key with no resolvable module can never spawn a match either, so gating on
+%% key presence alone would still let that class of mistake through. Rejecting
+%% at the edge stops an attacker inflating the queue with arbitrary mode strings
+%% that each slip past the per-(player, mode) ticket guard, and turns a
+%% typo'd/omitted/half-configured mode into an immediate 400 instead of a
+%% silent queue that only ever ends in `matchmaker_expired' after `max_wait'.
 -spec known_mode(term()) -> boolean().
-known_mode(Mode) when is_binary(Mode) ->
-    Modes = ensure_map(application:get_env(asobi, game_modes, #{})),
-    Mode =:= ~"default" orelse is_map_key(Mode, Modes);
+known_mode(Mode) when is_binary(Mode), byte_size(Mode) =< 64 ->
+    resolve_game_module(Mode) =/= {error, not_found};
 known_mode(_) ->
     false.
 
@@ -639,18 +643,50 @@ known_mode_test_() ->
     {setup,
         fun() ->
             Prev = application:get_env(asobi, game_modes),
-            application:set_env(asobi, game_modes, #{~"arena" => #{}}),
+            application:set_env(asobi, game_modes, #{
+                ~"arena" => #{module => some_mod}, ~"halfconfigured" => #{}
+            }),
             Prev
         end,
         fun
             ({ok, V}) -> application:set_env(asobi, game_modes, V);
             (undefined) -> application:unset_env(asobi, game_modes)
         end, [
-            ?_assert(known_mode(~"default")),
+            %% A multi-mode manifest that never maps "default" (asobi#243 incident:
+            %% a malformed client call silently fell back to "default", which was
+            %% unconditionally accepted here, then failed later with
+            %% no_game_module instead of an immediate 400).
+            ?_assertNot(known_mode(~"default")),
             ?_assert(known_mode(~"arena")),
+            %% A key with no resolvable `module' can never spawn a match either -
+            %% key presence alone must not be enough (found in security review).
+            ?_assertNot(known_mode(~"halfconfigured")),
             ?_assertNot(known_mode(~"nope")),
             ?_assertNot(known_mode(12345)),
-            ?_assertNot(known_mode(<<0, 255>>))
+            ?_assertNot(known_mode(<<0, 255>>)),
+            %% Reject oversized mode strings before the map lookup (security
+            %% review): a longer value matches no registered mode anyway, so
+            %% there's no reason to pay for one, mirroring the 64-byte cap
+            %% already enforced on `mode` at the world edge.
+            ?_assertNot(known_mode(binary:copy(~"a", 65)))
+        ]}.
+
+%% A mapped "default" (what asobi_lua_config:load_single_mode/2 registers for a
+%% single-mode game) is accepted like any other mode - known_mode/1 no longer
+%% special-cases the string itself. The cross-repo half of this contract (that
+%% load_single_mode/2 actually produces a "default" key) is asobi_lua's to test.
+known_mode_single_mode_default_test_() ->
+    {setup,
+        fun() ->
+            Prev = application:get_env(asobi, game_modes),
+            application:set_env(asobi, game_modes, #{~"default" => #{module => some_mod}}),
+            Prev
+        end,
+        fun
+            ({ok, V}) -> application:set_env(asobi, game_modes, V);
+            (undefined) -> application:unset_env(asobi, game_modes)
+        end, [
+            ?_assert(known_mode(~"default"))
         ]}.
 
 -endif.
