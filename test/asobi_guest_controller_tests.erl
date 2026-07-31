@@ -2,6 +2,12 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+%% authenticate/1 only pattern-matches the `json` key here, so a bare map is
+%% fine at runtime - this just tells eqwalizer to trust it as a
+%% cowboy_req:req() for the duration of the test (mirrors asobi_body_cap_plugin_tests).
+-spec fake_req(map()) -> dynamic().
+fake_req(M) -> M.
+
 setup() ->
     application:set_env(asobi, guest_verifier_pepper, crypto:strong_rand_bytes(32)),
     ok.
@@ -14,7 +20,8 @@ verifier_test_() ->
         {"correct secret verifies", fun correct_secret_verifies/0},
         {"wrong secret is rejected", fun wrong_secret_rejected/0},
         {"tampered verifier is rejected", fun tampered_verifier_rejected/0},
-        {"verify fails closed without a pepper", fun no_pepper_fails_closed/0}
+        {"verify fails closed without a pepper", fun no_pepper_fails_closed/0},
+        {"make_verifier fails loud without a pepper", fun make_verifier_no_pepper_errors/0}
     ]}.
 
 correct_secret_verifies() ->
@@ -39,6 +46,14 @@ no_pepper_fails_closed() ->
     ?assertNot(asobi_guest_controller:verify(Secret, Meta)),
     application:set_env(asobi, guest_verifier_pepper, crypto:strong_rand_bytes(32)).
 
+make_verifier_no_pepper_errors() ->
+    application:unset_env(asobi, guest_verifier_pepper),
+    ?assertError(
+        guest_verifier_pepper_missing,
+        asobi_guest_controller:make_verifier(crypto:strong_rand_bytes(32))
+    ),
+    application:set_env(asobi, guest_verifier_pepper, crypto:strong_rand_bytes(32)).
+
 decode_secret_test() ->
     ?assertMatch(
         {ok, _}, asobi_guest_controller:decode_secret(base64:encode(crypto:strong_rand_bytes(32)))
@@ -61,12 +76,12 @@ decode_secret_upper_bound_test() ->
 
 authenticate_disabled_returns_403_test() ->
     application:unset_env(asobi, guest_auth),
-    Req = #{
+    Req = fake_req(#{
         json => #{
             ~"device_id" => ~"dev-abc",
             ~"device_secret" => base64:encode(crypto:strong_rand_bytes(32))
         }
-    },
+    }),
     ?assertMatch(
         {json, 403, _, #{error := ~"guest_auth_disabled", message := _}},
         asobi_guest_controller:authenticate(Req)
