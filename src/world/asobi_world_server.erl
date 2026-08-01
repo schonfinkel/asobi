@@ -566,13 +566,13 @@ spawn_zones(
     %% Pre-warm all zones via zone_manager (uses base config with terrain_store_pid etc.)
     ok = asobi_zone_manager:pre_warm(ZoneManagerPid),
     %% Add recovered entities to zones
-    restore_entities(AllCoords, Entities, ZoneManagerPid),
+    restore_entities(AllCoords, Entities, ZoneManagerPid, WorldId),
     State#{game_state => GS1}.
 
--spec restore_entities([term()], map(), pid() | atom()) -> ok.
-restore_entities([], _Entities, _ZoneManagerPid) ->
+-spec restore_entities([term()], map(), pid() | atom(), binary()) -> ok.
+restore_entities([], _Entities, _ZoneManagerPid, _WorldId) ->
     ok;
-restore_entities([{CX, CY} = Coords | Rest], Entities, ZoneManagerPid) when
+restore_entities([{CX, CY} = Coords | Rest], Entities, ZoneManagerPid, WorldId) when
     is_integer(CX), is_integer(CY)
 ->
     RecoveredEnts = maps:get(Coords, Entities, #{}),
@@ -580,15 +580,33 @@ restore_entities([{CX, CY} = Coords | Rest], Entities, ZoneManagerPid) when
         0 ->
             ok;
         _ ->
-            {ok, ZonePid} = asobi_zone_manager:ensure_zone(ZoneManagerPid, Coords),
-            maps:foreach(
-                fun(EId, EState) -> asobi_zone:add_entity(ZonePid, EId, EState) end,
-                RecoveredEnts
-            )
+            %% asobi#258: see place_player/4 for why this isn't a bare match.
+            case asobi_zone_manager:ensure_zone(ZoneManagerPid, Coords) of
+                {error, Reason} ->
+                    %% ERROR, not WARNING: unlike the routine capacity
+                    %% rejections on the runtime join/move paths, this drops
+                    %% previously-persisted entity state for the zone - real
+                    %% data loss, not just backpressure (asobi#258 review).
+                    ?LOG_ERROR(#{
+                        event => restore_entities_zone_unavailable,
+                        world_id => WorldId,
+                        coords => Coords,
+                        entity_count => map_size(RecoveredEnts),
+                        reason => Reason
+                    }),
+                    asobi_telemetry:game_error(zone_unavailable, #{
+                        world_id => WorldId, coords => Coords, reason => Reason
+                    });
+                {ok, ZonePid} ->
+                    maps:foreach(
+                        fun(EId, EState) -> asobi_zone:add_entity(ZonePid, EId, EState) end,
+                        RecoveredEnts
+                    )
+            end
     end,
-    restore_entities(Rest, Entities, ZoneManagerPid);
-restore_entities([_ | Rest], Entities, ZoneManagerPid) ->
-    restore_entities(Rest, Entities, ZoneManagerPid).
+    restore_entities(Rest, Entities, ZoneManagerPid, WorldId);
+restore_entities([_ | Rest], Entities, ZoneManagerPid, WorldId) ->
+    restore_entities(Rest, Entities, ZoneManagerPid, WorldId).
 
 generate_zone_states(GameMod, Config) ->
     Seed = maps:get(seed, Config, erlang:system_time(millisecond)),
@@ -628,38 +646,56 @@ handle_join(
                 {ok, GS1} ->
                     {ok, SpawnPos} = Mod:spawn_position(PlayerId, GS1),
                     State1 = State#{game_state => GS1},
-                    {State2, ZonePid} = place_player(PlayerId, SpawnPos, State1),
-                    %% Monitor player session for reconnection handling
-                    PlayerPid = find_player_pid(PlayerId),
-                    MonRef = erlang:monitor(process, PlayerPid),
-                    Players1 = Players#{
-                        PlayerId => #{
-                            joined_at => erlang:system_time(millisecond),
-                            position => SpawnPos,
-                            session_pid => PlayerPid,
-                            monitor_ref => MonRef
-                        }
-                    },
-                    %% Track player→world for reconnection lookup
-                    remember_player_world(PlayerId, self()),
-                    VetoTokens = maps:get(veto_tokens, State2),
-                    VetoCount = maps:get(veto_tokens_per_player, State2),
-                    State3 = State2#{
-                        players => Players1,
-                        veto_tokens => VetoTokens#{PlayerId => VetoCount}
-                    },
-                    asobi_telemetry:world_player_joined(WorldId, PlayerId),
-                    ZoneCoords = pos_to_zone(SpawnPos, maps:get(zone_size, State3)),
-                    asobi_world_chat:player_joined(
-                        PlayerId, ZoneCoords, maps:get(chat_state, State3)
-                    ),
-                    State4 = notify_phase_player_joined(State3),
-                    %% Cancel any pending empty_grace timer — this player rescued the world
-                    %% from the grace window. The cancel is a no-op if no timer is pending.
-                    {keep_state, State4, [
-                        {reply, From, {ok, ZonePid}},
-                        {{timeout, empty_grace}, infinity, undefined}
-                    ]};
+                    case place_player(PlayerId, SpawnPos, State1) of
+                        {error, Reason, _State1} ->
+                            %% keep_state_and_data discards GS1, rolling the game
+                            %% module's join back along with the rejected placement
+                            %% rather than leaving it out of sync with a client that
+                            %% was told the join failed (asobi#258).
+                            ?LOG_WARNING(#{
+                                event => join_zone_unavailable,
+                                world_id => WorldId,
+                                player_id => PlayerId,
+                                reason => Reason
+                            }),
+                            asobi_telemetry:game_error(zone_unavailable, #{
+                                world_id => WorldId, reason => Reason
+                            }),
+                            {keep_state_and_data, [{reply, From, {error, zone_unavailable}}]};
+                        {ok, State2, ZonePid} ->
+                            %% Monitor player session for reconnection handling
+                            PlayerPid = find_player_pid(PlayerId),
+                            MonRef = erlang:monitor(process, PlayerPid),
+                            Players1 = Players#{
+                                PlayerId => #{
+                                    joined_at => erlang:system_time(millisecond),
+                                    position => SpawnPos,
+                                    session_pid => PlayerPid,
+                                    monitor_ref => MonRef
+                                }
+                            },
+                            %% Track player→world for reconnection lookup
+                            remember_player_world(PlayerId, self()),
+                            VetoTokens = maps:get(veto_tokens, State2),
+                            VetoCount = maps:get(veto_tokens_per_player, State2),
+                            State3 = State2#{
+                                players => Players1,
+                                veto_tokens => VetoTokens#{PlayerId => VetoCount}
+                            },
+                            asobi_telemetry:world_player_joined(WorldId, PlayerId),
+                            ZoneCoords = pos_to_zone(SpawnPos, maps:get(zone_size, State3)),
+                            asobi_world_chat:player_joined(
+                                PlayerId, ZoneCoords, maps:get(chat_state, State3)
+                            ),
+                            State4 = notify_phase_player_joined(State3),
+                            %% Cancel any pending empty_grace timer — this player rescued
+                            %% the world from the grace window. The cancel is a no-op if
+                            %% no timer is pending.
+                            {keep_state, State4, [
+                                {reply, From, {ok, ZonePid}},
+                                {{timeout, empty_grace}, infinity, undefined}
+                            ]}
+                    end;
                 {error, Reason} ->
                     {keep_state_and_data, [{reply, From, {error, Reason}}]}
             end
@@ -699,6 +735,12 @@ handle_leave(
             end
     end.
 
+%% asobi#258: ensure_zone/2 can fail (e.g. max_zones_reached); a bare
+%% {ok, ZonePid} = ... match here used to crash the whole world gen_statem -
+%% every player in it - on what should be a per-player placement failure.
+%% Callers get a tagged result and decide their own safe fallback.
+-spec place_player(binary(), {number(), number()}, map()) ->
+    {ok, map(), pid()} | {error, term(), map()}.
 place_player(
     PlayerId,
     {X, Y} = _Pos,
@@ -710,25 +752,31 @@ place_player(
     } = State
 ) ->
     ZoneCoords = pos_to_zone({X, Y}, ZoneSize),
-    {ok, ZonePid} = asobi_zone_manager:ensure_zone(ZMPid, ZoneCoords),
-    PlayerPid = find_player_pid(PlayerId),
-    asobi_zone:add_entity(ZonePid, PlayerId, #{x => X, y => Y, type => ~"player"}),
-    asobi_presence:send(PlayerId, {world_joined, self(), ZonePid}),
-    InterestZones = interest_zones(ZoneCoords, ViewRadius, GridSize),
-    subscribe_interest_zones(InterestZones, ZMPid, PlayerId, PlayerPid),
-    %% Drain the casts above (add_entity + subscribe) by issuing a sync call to
-    %% the zone. Without this, a world.input cast from the WS handler can race
-    %% past the add_entity cast (different sender = no FIFO) and the zone's
-    %% next tick runs apply_inputs against an entities map missing the player —
-    %% the Lua handle_input's "if not e then return entities end" guard then
-    %% silently drops the input. The sync call forces the zone to process its
-    %% mailbox up to here before we reply {ok, ZonePid} to the WS handler.
-    _ = asobi_zone:get_subscriber_count(ZonePid),
-    PlayerZones = maps:get(player_zones, State),
-    State1 = State#{
-        player_zones => PlayerZones#{PlayerId => #{zone => ZoneCoords, interest => InterestZones}}
-    },
-    {State1, ZonePid}.
+    case asobi_zone_manager:ensure_zone(ZMPid, ZoneCoords) of
+        {error, Reason} ->
+            {error, Reason, State};
+        {ok, ZonePid} ->
+            PlayerPid = find_player_pid(PlayerId),
+            asobi_zone:add_entity(ZonePid, PlayerId, #{x => X, y => Y, type => ~"player"}),
+            asobi_presence:send(PlayerId, {world_joined, self(), ZonePid}),
+            InterestZones = interest_zones(ZoneCoords, ViewRadius, GridSize),
+            subscribe_interest_zones(InterestZones, ZMPid, PlayerId, PlayerPid),
+            %% Drain the casts above (add_entity + subscribe) by issuing a sync call to
+            %% the zone. Without this, a world.input cast from the WS handler can race
+            %% past the add_entity cast (different sender = no FIFO) and the zone's
+            %% next tick runs apply_inputs against an entities map missing the player —
+            %% the Lua handle_input's "if not e then return entities end" guard then
+            %% silently drops the input. The sync call forces the zone to process its
+            %% mailbox up to here before we reply {ok, ZonePid} to the WS handler.
+            _ = asobi_zone:get_subscriber_count(ZonePid),
+            PlayerZones = maps:get(player_zones, State),
+            State1 = State#{
+                player_zones => PlayerZones#{
+                    PlayerId => #{zone => ZoneCoords, interest => InterestZones}
+                }
+            },
+            {ok, State1, ZonePid}
+    end.
 
 remove_player_from_zones(
     PlayerId,
@@ -755,6 +803,7 @@ handle_move(
     PlayerId,
     {X, Y} = NewPos,
     #{
+        world_id := WorldId,
         players := Players,
         player_zones := PlayerZones,
         zone_manager_pid := ZMPid,
@@ -786,27 +835,79 @@ handle_move(
                     ),
                     {keep_state, State#{players => Players1}};
                 false ->
-                    State1 = remove_player_from_zones(PlayerId, State),
-                    {State2, _NewZonePid} = place_player(PlayerId, NewPos, State1),
-                    asobi_world_chat:player_zone_changed(
-                        PlayerId, OldZoneCoords, NewZoneCoords, GridSize, ChatState
-                    ),
-                    Players1 = maps:update_with(
-                        PlayerId,
-                        fun(Meta) -> Meta#{position => NewPos} end,
-                        maps:get(players, State2)
-                    ),
-                    PlayerPid = find_player_pid(PlayerId),
-                    {ok, ZonePid} = asobi_zone_manager:ensure_zone(ZMPid, NewZoneCoords),
-                    PlayerPid ! {asobi_message, {world_zone_changed, ZonePid}},
-                    NewInterest = interest_zones(NewZoneCoords, ViewRadius, GridSize),
-                    PZ = maps:get(player_zones, State2),
-                    {keep_state, State2#{
-                        players => Players1,
-                        player_zones => PZ#{
-                            PlayerId => #{zone => NewZoneCoords, interest => NewInterest}
-                        }
-                    }}
+                    %% asobi#258: check the destination zone BEFORE removing the
+                    %% player from their current one - a crash-free version of
+                    %% this same ordering would still have stranded them
+                    %% zoneless on failure. Pre-checking keeps a failed crossing
+                    %% a pure no-op instead.
+                    case asobi_zone_manager:ensure_zone(ZMPid, NewZoneCoords) of
+                        {error, Reason} ->
+                            ?LOG_WARNING(#{
+                                event => move_zone_unavailable,
+                                world_id => WorldId,
+                                player_id => PlayerId,
+                                coords => NewZoneCoords,
+                                reason => Reason
+                            }),
+                            asobi_telemetry:game_error(zone_unavailable, #{
+                                world_id => WorldId, coords => NewZoneCoords, reason => Reason
+                            }),
+                            keep_state_and_data;
+                        {ok, _} ->
+                            State1 = remove_player_from_zones(PlayerId, State),
+                            %% place_player/4's own ensure_zone call for these same
+                            %% coords now hits the fast (already-created) path - the
+                            %% precheck above and this call target the same coords in
+                            %% the same synchronous callback, with no yield point for
+                            %% the zone to be reaped in between. {error, _, _} here is
+                            %% not reachable under current asobi_zone_manager
+                            %% invariants; handled defensively (not a bare match)
+                            %% rather than trusting that to hold forever.
+                            case place_player(PlayerId, NewPos, State1) of
+                                {error, Reason, _} ->
+                                    %% remove_player_from_zones/2's casts to the OLD
+                                    %% zone already fired and can't be recalled, so
+                                    %% this player's player_zones bookkeeping is left
+                                    %% stale rather than crashing the whole world over
+                                    %% a should-be-unreachable edge case.
+                                    ?LOG_ERROR(#{
+                                        event => move_zone_unavailable_after_removal,
+                                        world_id => WorldId,
+                                        player_id => PlayerId,
+                                        coords => NewZoneCoords,
+                                        reason => Reason
+                                    }),
+                                    asobi_telemetry:game_error(zone_unavailable, #{
+                                        world_id => WorldId,
+                                        coords => NewZoneCoords,
+                                        reason => Reason
+                                    }),
+                                    {keep_state, State1};
+                                {ok, State2, ZonePid} ->
+                                    asobi_world_chat:player_zone_changed(
+                                        PlayerId, OldZoneCoords, NewZoneCoords, GridSize, ChatState
+                                    ),
+                                    Players1 = maps:update_with(
+                                        PlayerId,
+                                        fun(Meta) -> Meta#{position => NewPos} end,
+                                        maps:get(players, State2)
+                                    ),
+                                    PlayerPid = find_player_pid(PlayerId),
+                                    PlayerPid ! {asobi_message, {world_zone_changed, ZonePid}},
+                                    NewInterest = interest_zones(
+                                        NewZoneCoords, ViewRadius, GridSize
+                                    ),
+                                    PZ = maps:get(player_zones, State2),
+                                    {keep_state, State2#{
+                                        players => Players1,
+                                        player_zones => PZ#{
+                                            PlayerId => #{
+                                                zone => NewZoneCoords, interest => NewInterest
+                                            }
+                                        }
+                                    }}
+                            end
+                    end
             end
     end.
 
