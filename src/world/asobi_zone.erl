@@ -432,12 +432,16 @@ terminate(normal, #{world_id := WorldId, coords := Coords} = State) ->
     maybe_final_snapshot(State),
     clear_zone_backup(WorldId, Coords),
     notify_zone_manager_terminated(State),
+    %% asobi#252 review: a zone that ever suppressed a log line leaves a
+    %% permanent drop-count row otherwise - this Key's lifetime ends here.
+    asobi_script_log_limiter:forget({WorldId, Coords}),
     pg:leave(?PG_SCOPE, {asobi_zone, WorldId, Coords}, self()),
     ok;
 terminate({shutdown, _}, #{world_id := WorldId, coords := Coords} = State) ->
     maybe_final_snapshot(State),
     clear_zone_backup(WorldId, Coords),
     notify_zone_manager_terminated(State),
+    asobi_script_log_limiter:forget({WorldId, Coords}),
     pg:leave(?PG_SCOPE, {asobi_zone, WorldId, Coords}, self()),
     ok;
 terminate(_Reason, #{world_id := WorldId, coords := Coords, entities := Entities} = State) ->
@@ -445,6 +449,7 @@ terminate(_Reason, #{world_id := WorldId, coords := Coords, entities := Entities
     maybe_final_snapshot(State),
     backup_zone_state(WorldId, Coords, Entities),
     notify_zone_manager_terminated(State),
+    asobi_script_log_limiter:forget({WorldId, Coords}),
     pg:leave(?PG_SCOPE, {asobi_zone, WorldId, Coords}, self()),
     ok.
 
@@ -764,13 +769,22 @@ log_spawn_failed(TemplateId, Reason, #{world_id := WorldId, coords := Coords}) -
     %% Caller-supplied (a Lua script can pass player input straight through
     %% to game.zone.spawn); game_error/2 requires bounded details.
     Id = bound_template_id(TemplateId),
-    ?LOG_WARNING(#{
-        event => zone_spawn_failed,
-        world_id => WorldId,
-        coords => Coords,
-        template_id => Id,
-        reason => Reason
-    }),
+    %% asobi#252: a tick-loop script with a typo'd template_id logs once per
+    %% tick forever. The telemetry counter stays unconditional so dashboards
+    %% see the true rate; only the log line itself is rate-limited per zone.
+    case asobi_script_log_limiter:allow({WorldId, Coords}) of
+        {true, DroppedSinceLastLog} ->
+            ?LOG_WARNING(#{
+                event => zone_spawn_failed,
+                world_id => WorldId,
+                coords => Coords,
+                template_id => Id,
+                reason => Reason,
+                suppressed_since_last => DroppedSinceLastLog
+            });
+        false ->
+            ok
+    end,
     asobi_telemetry:game_error(unknown_spawn_template, #{
         world_id => WorldId,
         template_id => Id
