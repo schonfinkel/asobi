@@ -491,9 +491,14 @@ do_tick(
     Now = erlang:system_time(millisecond),
     {TimerEvents, ET1} = asobi_entity_timer:tick(Now, ET),
     Entities3 = apply_timer_events(TimerEvents, Entities2),
-    %% Tick spawner — process respawn queue
-    Spawner = maps:get(spawner, State),
-    {Respawns, FailedRespawns, Spawner1} = asobi_zone_spawner:tick(Now, Spawner),
+    %% Tick spawner — process respawn queue. asobi#253: pick up a live
+    %% template update (e.g. a script hot-reload) before ticking, so a
+    %% just-renamed/added template doesn't have to wait for the next respawn
+    %% window to become spawnable.
+    Spawner0 = maybe_apply_spawn_templates_hint(
+        GameMod, ZoneState1, maps:get(spawner, State), WorldId, Coords
+    ),
+    {Respawns, FailedRespawns, Spawner1} = asobi_zone_spawner:tick(Now, Spawner0),
     lists:foreach(
         fun
             ({TemplateId, unknown_template = Reason}) when is_binary(TemplateId) ->
@@ -674,9 +679,7 @@ transfer_out_of_bounds_npcs(
     Entities1 = maps:without(ToRemove, Entities),
     Grid = maps:get(spatial_grid, State, undefined),
     Grid1 = remove_from_grid(ToRemove, Grid),
-    State#{entities => Entities1, spatial_grid => Grid1};
-transfer_out_of_bounds_npcs(State) ->
-    State.
+    State#{entities => Entities1, spatial_grid => Grid1}.
 
 %% --- Snapshot Helpers ---
 
@@ -759,6 +762,48 @@ has_tickable_entities(Entities) ->
         Entities
     ).
 
+%% asobi#253: spawn_templates/1 is only ever called once, at zone creation -
+%% a long-running zone never learns about a template added/renamed by a
+%% later script hot-reload, so it surfaces as unknown_spawn_template
+%% indefinitely rather than just until the next reload. spawn_templates_hint/1
+%% is optional and runs every tick, so it must be cheap when nothing
+%% changed - the callback owns that cost, not this call site.
+-spec maybe_apply_spawn_templates_hint(
+    module(), term(), asobi_zone_spawner:state(), binary(), {integer(), integer()}
+) -> asobi_zone_spawner:state().
+maybe_apply_spawn_templates_hint(GameMod, ZoneState, Spawner, WorldId, Coords) ->
+    case erlang:function_exported(GameMod, spawn_templates_hint, 1) of
+        false ->
+            Spawner;
+        true ->
+            case GameMod:spawn_templates_hint(ZoneState) of
+                {changed, NewTemplates} when is_map(NewTemplates) ->
+                    ?LOG_NOTICE(#{
+                        event => zone_spawn_templates_updated,
+                        world_id => WorldId,
+                        coords => Coords,
+                        template_count => map_size(NewTemplates)
+                    }),
+                    asobi_zone_spawner:set_templates(NewTemplates, Spawner);
+                unchanged ->
+                    Spawner;
+                Other ->
+                    %% A malformed callback return (anything but `unchanged` or
+                    %% a well-formed `{changed, Map}`) is a bug in the game
+                    %% module's implementation, not a normal "nothing changed"
+                    %% outcome - surface it rather than silently no-op like the
+                    %% expected `unchanged` case does.
+                    ?LOG_WARNING(#{
+                        event => zone_spawn_templates_hint_malformed,
+                        world_id => WorldId,
+                        coords => Coords,
+                        game_module => GameMod,
+                        returned => bound_debug_term(Other)
+                    }),
+                    Spawner
+            end
+    end.
+
 %% asobi_zone_spawner:spawn_entity/4's only error today is unknown_template.
 %% The cast API (game.zone.spawn and world-server spawn_at) can't return this
 %% synchronously to the caller, so this is the only place it becomes
@@ -798,6 +843,20 @@ log_spawn_failed(TemplateId, Reason, #{world_id := WorldId, coords := Coords}) -
 -spec bound_template_id(binary()) -> binary().
 bound_template_id(TemplateId) ->
     Head = binary:part(TemplateId, 0, min(64, byte_size(TemplateId))),
+    case unicode:characters_to_binary(Head) of
+        Valid when is_binary(Valid) -> Valid;
+        {incomplete, Valid, _} -> Valid;
+        {error, Valid, _} -> Valid
+    end.
+
+%% A malformed spawn_templates_hint/1 return can be an arbitrary Erlang term
+%% (the callback is game-module code, not asobi's own); ~p-format it before
+%% logging so nova_jsonlogger's JSON encoder always sees a plain, bounded
+%% binary rather than a raw pid/reference/fun it cannot encode.
+-spec bound_debug_term(term()) -> binary().
+bound_debug_term(Term) ->
+    Formatted = iolist_to_binary(io_lib:format("~0p", [Term])),
+    Head = binary:part(Formatted, 0, min(200, byte_size(Formatted))),
     case unicode:characters_to_binary(Head) of
         Valid when is_binary(Valid) -> Valid;
         {incomplete, Valid, _} -> Valid;
