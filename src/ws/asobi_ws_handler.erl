@@ -24,6 +24,18 @@
 %% holding cowboy acceptors. Override via `asobi.ws_idle_auth_timeout_ms`.
 -define(DEFAULT_IDLE_AUTH_TIMEOUT_MS, 10000).
 
+%% `game.message` and `game.error` name their producer in the payload's
+%% `module` key, not in the wire type, so an extension can emit them
+%% without a new frame type per extension. A producer that sends the
+%% legacy two-element shape (`{game_message, Payload}`,
+%% `{script_error, Payload}`) predates that and can only be asobi_lua.
+%%
+%% The `module.`-prefixed type rename is deliberately deferred to the 1.0
+%% wire break: the payload key is the part SDKs dispatch on, and renaming
+%% the type now would either break every shipped SDK or double every
+%% frame on the hot path.
+-define(DEFAULT_EXTENSION, lua).
+
 %% #303: script-controlled `game.broadcast` event names share the wire
 %% namespace with asobi's own `match.*`/`world.*` events, so they must be
 %% bounded and validated before ever reaching event_name_binary/1's caller.
@@ -252,23 +264,32 @@ websocket_info({asobi_message, {notification, Notif}}, State) ->
     Reply = encode_reply(undefined, ~"notification.new", Notif),
     {reply, {text, Reply}, State};
 websocket_info({asobi_message, {game_message, Payload}}, State) ->
+    websocket_info({asobi_message, {game_message, ?DEFAULT_EXTENSION, Payload}}, State);
+websocket_info({asobi_message, {game_message, Extension, Payload}}, State) when
+    is_atom(Extension)
+->
     %% Wrapped, not sent raw: every other wire event's payload is an
     %% object (enforced by asobi_protocol_coverage_tests), but
     %% game.send/2 accepts any Lua value (string, number, table) as
     %% the message, so a bare scalar payload would break that
     %% convention and couldn't carry more fields later without a
     %% breaking change.
-    Reply = encode_reply(undefined, ~"game.message", #{~"message" => Payload}),
-    {reply, {text, Reply}, State};
+    Body = #{~"module" => atom_to_binary(Extension), ~"message" => Payload},
+    {reply, {text, encode_reply(undefined, ~"game.message", Body)}, State};
 websocket_info({asobi_message, {script_error, Payload}}, State) when is_map(Payload) ->
-    %% Dev-mode Lua callback errors (asobi_lua#98). Only ever emitted when
-    %% the runtime has dev errors enabled; production runtimes never send
+    websocket_info({asobi_message, {script_error, ?DEFAULT_EXTENSION, Payload}}, State);
+websocket_info({asobi_message, {script_error, Extension, Payload}}, State) when
+    is_atom(Extension), is_map(Payload)
+->
+    %% Dev-mode extension callback errors (asobi_lua#98). Only ever emitted
+    %% when the runtime has dev errors enabled; production runtimes never send
     %% this, so script internals stay server-side. Encoded defensively: a
     %% future producer sending a non-JSON-encodable map must degrade to an
     %% error frame, not crash the connection process.
+    Body = Payload#{~"module" => atom_to_binary(Extension)},
     Reply =
         try
-            encode_reply(undefined, ~"game.error", Payload)
+            encode_reply(undefined, ~"game.error", Body)
         catch
             _:_ -> encode_reply(undefined, ~"error", #{reason => ~"internal"})
         end,
