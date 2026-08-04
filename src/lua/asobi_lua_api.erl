@@ -19,6 +19,8 @@ game.log(level, message, meta)                   -- with a metadata table
 
 -- Messaging
 game.broadcast(event, payload)                   -- broadcast to all match players
+                                                 -- event: 1-64 chars of [A-Za-z0-9_-],
+                                                 -- and not an asobi-reserved name
 game.send(player_id, message)                    -- send to specific player
 
 -- Economy
@@ -73,7 +75,11 @@ The persistence-style calls (`economy.*`, `storage.*`, `leaderboard.top/rank/aro
 success, `{ error = "reason" }` on failure (`ok_result/2` / `error_result/2` via
 `wrap_result/2`). Read `result.ok`. The plain calls (`broadcast`, `send`,
 `chat.send`, `zone.spawn`/`despawn`, `leaderboard.submit`, `spatial.*`) return
-their value directly.
+their value directly. `broadcast` is the exception on the failure side: an
+event name asobi rejects at the socket boundary (empty, over 64 bytes,
+outside `[A-Za-z0-9_-]`, or one of asobi's own reserved wire event names such
+as `state`/`tick`/`finished`) returns `{ error = "reason" }` rather than
+being silently dropped downstream.
 """.
 
 -include_lib("kernel/include/logger.hrl").
@@ -82,7 +88,7 @@ their value directly.
 -export([install/2]).
 -export([deep_decode/1, decode_to_map/2]).
 -export([to_storage_value/1]).
--export([atomize_entities/1]).
+-export([atomize_entities/1, atomize_keys/1]).
 
 -spec install(map(), dynamic()) -> dynamic().
 install(#{probe := true} = Ctx, St0) ->
@@ -326,17 +332,40 @@ fun_broadcast(#{match_pid := MatchPid}) ->
     fun(Args, St) ->
         case decode_args(Args, St) of
             [Event, Payload] when is_binary(Event) ->
-                asobi_match_server:broadcast_event(MatchPid, Event, to_map(Payload)),
-                {[true], St};
+                do_broadcast(MatchPid, Event, to_map(Payload), St);
             [Event] when is_binary(Event) ->
-                asobi_match_server:broadcast_event(MatchPid, Event, #{}),
-                {[true], St};
+                do_broadcast(MatchPid, Event, #{}, St);
             _ ->
                 error_result(~"broadcast requires (event, payload)", St)
         end
     end;
 fun_broadcast(_) ->
     fun(_, St) -> error_result(~"broadcast not available (no match context)", St) end.
+
+%% #303 already rejects an out-of-shape name at the socket boundary, but the
+%% script only saw a server-side log line and a dropped event. Ask the same
+%% owner (asobi_ws_handler:event_name_binary/1) before the fan-out so the
+%% author gets `{ error = "..." }` at the game.broadcast call site - the rules
+%% themselves stay in one place.
+do_broadcast(MatchPid, Event, Payload, St) ->
+    case asobi_ws_handler:event_name_binary(Event) of
+        {ok, _} ->
+            asobi_match_server:broadcast_event(MatchPid, Event, Payload),
+            {[true], St};
+        {error, reserved_event_name} ->
+            error_result(
+                iolist_to_binary([
+                    ~"broadcast event name \"",
+                    Event,
+                    ~"\" is reserved by asobi (",
+                    lists:join(~", ", asobi_ws_handler:reserved_event_names()),
+                    ~")"
+                ]),
+                St
+            );
+        {error, invalid_event_name} ->
+            error_result(~"broadcast event name must be 1-64 chars of [A-Za-z0-9_-]", St)
+    end.
 
 fun_send() ->
     fun(Args, St) ->
@@ -814,7 +843,9 @@ fun_zone_spawn(#{zone_pid := ZonePid} = Ctx) ->
                         %% populated, string-keyed table already decodes to a map.
                         case Overrides0 of
                             Overrides when is_map(Overrides) ->
-                                asobi_zone:spawn_entity(ZonePid, TemplateId, {X, Y}, Overrides),
+                                asobi_zone:spawn_entity(
+                                    ZonePid, TemplateId, {X, Y}, atomize_keys(Overrides)
+                                ),
                                 {[true], St};
                             [] ->
                                 asobi_zone:spawn_entity(ZonePid, TemplateId, {X, Y}, #{}),
@@ -1193,6 +1224,11 @@ atomize_entities(Entities) ->
         Entities
     ).
 
+%% Same conversion for a single entity-shaped map: a spawn template's
+%% base_state and a game.zone.spawn override table both become entity fields
+%% inside asobi_zone_spawner:spawn_entity/5, so they have to arrive in the
+%% same key shape zone_tick results do. See widgrensit/asobi_lua#118.
+-spec atomize_keys(map()) -> map().
 atomize_keys(M) when is_map(M) ->
     maps:fold(
         fun(K, V, Acc) ->
