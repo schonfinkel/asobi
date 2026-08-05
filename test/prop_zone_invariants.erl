@@ -32,16 +32,24 @@
 }).
 
 zone_invariants_test_() ->
-    {setup, fun setup/0, fun cleanup/1, fun(Ctx) ->
-        [
-            {timeout, max(60, ?NUMTESTS div 2),
-                ?_assert(
-                    proper:quickcheck(prop_zone_invariants(Ctx), [
-                        {numtests, ?NUMTESTS}, {to_file, user}
-                    ])
-                )}
-        ]
-    end}.
+    %% Two timeouts, because there are two ways this cancels a group with
+    %% zero failures and nothing named. The outer one covers setup/0 and
+    %% cleanup/1, which otherwise run under eunit's 5s default; the inner
+    %% one is the property's own, and its floor is 300s rather than 60s
+    %% because 60 is a performance budget, not a hang detector - a CI runner
+    %% managed 21 of 25 iterations of the reconnect property inside it
+    %% (asobi#376).
+    {timeout, 120,
+        {setup, fun setup/0, fun cleanup/1, fun(Ctx) ->
+            [
+                {timeout, max(300, ?NUMTESTS div 2),
+                    ?_assert(
+                        proper:quickcheck(prop_zone_invariants(Ctx), [
+                            {numtests, ?NUMTESTS}, {to_file, user}
+                        ])
+                    )}
+            ]
+        end}}.
 
 setup() ->
     {ok, _} = application:ensure_all_started(telemetry),
