@@ -15,7 +15,10 @@
     reaper_erases_a_guest_with_a_row_in_every_child_table/1,
     reaper_spares_an_old_guest_that_still_plays/1,
     create_retries_on_username_collision/1,
-    create_no_retry_on_non_unique_username_error/1
+    create_no_retry_on_non_unique_username_error/1,
+    a_full_deployment_says_capacity_reached/1,
+    an_uncountable_table_says_unavailable_not_capacity/1,
+    a_saturated_global_limiter_says_rate_limited/1
 ]).
 
 all() ->
@@ -30,7 +33,10 @@ all() ->
         reaper_erases_a_guest_with_a_row_in_every_child_table,
         reaper_spares_an_old_guest_that_still_plays,
         create_retries_on_username_collision,
-        create_no_retry_on_non_unique_username_error
+        create_no_retry_on_non_unique_username_error,
+        a_full_deployment_says_capacity_reached,
+        an_uncountable_table_says_unavailable_not_capacity,
+        a_saturated_global_limiter_says_rate_limited
     ].
 
 %% Set AFTER the app starts, not before. Booting asobi runs
@@ -553,5 +559,67 @@ create_no_retry_on_non_unique_username_error(Config) ->
         ?assertEqual(1, meck:num_calls(asobi_repo, insert, '_'))
     after
         meck:unload(asobi_repo)
+    end,
+    Config.
+
+%% asobi#419: the three refusals used to answer with one code, so a report of
+%% "capacity reached" from the field could be any of them. Each is wired end to
+%% end here, at the HTTP boundary a client actually sees, because the split is
+%% only worth anything if the code reaches the client.
+
+a_full_deployment_says_capacity_reached(Config) ->
+    application:set_env(asobi, guest_unlinked_cap, 0),
+    try
+        {ok, R} = create(device_id(), secret(), Config),
+        ?assertStatus(503, R),
+        ?assertMatch(
+            #{~"error" := #{~"code" := ~"guest.capacity_reached"}}, nova_test:json(R)
+        )
+    after
+        application:unset_env(asobi, guest_unlinked_cap)
+    end,
+    Config.
+
+%% The one this change exists for. A repo error while counting is not a full
+%% deployment, and answering as though it were is what made the original report
+%% undiagnosable. Still a refusal - the cap fails closed - under its own code.
+an_uncountable_table_says_unavailable_not_capacity(Config) ->
+    meck:new(asobi_guest_reaper, [passthrough]),
+    meck:expect(asobi_guest_reaper, cached_unlinked_count, fun() -> unknown end),
+    try
+        {ok, R} = create(device_id(), secret(), Config),
+        ?assertStatus(503, R),
+        ?assertMatch(#{~"error" := #{~"code" := ~"guest.unavailable"}}, nova_test:json(R))
+    after
+        meck:unload(asobi_guest_reaper)
+    end,
+    Config.
+
+%% The global limiter is a throughput bound, not a ceiling: a 429 with a
+%% retry_after tells a client to come back, where the old 503 told it the
+%% deployment was full and there was nothing to come back for.
+a_saturated_global_limiter_says_rate_limited(Config) ->
+    Restore = #{algorithm => sliding_window, limit => 100, window => 1000},
+    ok = seki:delete_limiter(asobi_guest_global_limiter),
+    %% limit 1, not 0: seki divides by the limit to compute retry_after, so a
+    %% zero-limit bucket crashes instead of denying (Taure/seki#17). One create
+    %% to spend the budget, a second to be refused by it.
+    ok = seki:new_limiter(asobi_guest_global_limiter, Restore#{limit => 1}),
+    try
+        {ok, First} = create(device_id(), secret(), Config),
+        ?assertStatus(200, First),
+        {ok, R} = create(device_id(), secret(), Config),
+        ?assertStatus(429, R),
+        ?assertMatch(
+            #{
+                ~"error" := #{
+                    ~"code" := ~"guest.rate_limited", ~"details" := #{~"retry_after" := _}
+                }
+            },
+            nova_test:json(R)
+        )
+    after
+        ok = seki:delete_limiter(asobi_guest_global_limiter),
+        ok = seki:new_limiter(asobi_guest_global_limiter, Restore)
     end,
     Config.

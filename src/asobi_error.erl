@@ -112,11 +112,24 @@ working and a new one reads one place: see `legacy/2`.
     {~"guest.invalid_device_secret", 401, ~"The device secret does not match this device."},
     {~"guest.revoked", 401, ~"This device's guest credential has been revoked."},
     {~"guest.already_upgraded", 401, ~"This account was claimed. Sign in with its credentials."},
+    {~"guest.rate_limited", 429, ~"Guests are being created too fast right now. Retry shortly."},
     {~"guest.capacity_reached", 503, ~"The deployment is not creating more guests right now."},
+    {~"guest.unavailable", 503, ~"The deployment could not check guest capacity. Retry shortly."},
     {~"guest.device_already_registered", 409, ~"Another guest already registered this device."},
     {~"guest.not_unclaimed", 409, ~"Only an unclaimed guest account can be upgraded."},
     {~"guest.create_failed", 500, ~"The guest player could not be created."},
     {~"player.not_found", 404, ~"No player exists with this id."},
+    {
+        ~"player.confirmation_failed",
+        403,
+        ~"The password does not match this account. Nothing was deleted."
+    },
+    {
+        ~"player.credentials_changed",
+        409,
+        ~"This account's credentials changed while the request was in flight. Retry."
+    },
+    {~"player.erase_failed", 500, ~"The account could not be erased. Nothing was deleted."},
 
     %% Sessions, worlds, matches, tickets.
     {~"world.player_limit_reached", 429, ~"This player already owns as many worlds as allowed."},

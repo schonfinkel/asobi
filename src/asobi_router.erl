@@ -66,6 +66,20 @@ api_routes() ->
             %% Players
             {~"/players/:id", fun asobi_player_controller:show/1, #{methods => [get, options]}},
             {~"/players/:id", fun asobi_player_controller:update/1, #{methods => [put, options]}},
+            %% POST, not DELETE, and it echoes a credential in the body -
+            %% the same shape as the operator's `/ops/players/:id/erase` one
+            %% layer up. `nova_request_plugin` skips JSON decoding entirely on
+            %% GET and DELETE (RFC 9110 gives a DELETE body no semantics), so a
+            %% DELETE could never carry the password confirmation this route is
+            %% gated on.
+            %%
+            %% Declared AFTER `/players/:id`: routing_tree prepends on insert
+            %% and returns on the first matching sibling, so a literal declared
+            %% ahead of a binding is swallowed by it (asobi#326, the
+            %% `/matches/live` trap).
+            {~"/players/me/erase", fun asobi_player_controller:erase_self/1, #{
+                methods => [post, options]
+            }},
 
             %% Worlds
             {~"/worlds", fun asobi_world_controller:index/1, #{methods => [get, options]}},

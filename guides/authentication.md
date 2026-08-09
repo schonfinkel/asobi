@@ -349,6 +349,38 @@ Upgrade revokes every token the guest held (a fresh pair is returned) and
 deletes the device verifier, so the old device secret can no longer sign in.
 Player id, progress, wallets, and inventory are preserved.
 
+### Delete the account
+
+Guest removal is not a guest route. `POST /api/v1/players/me/erase` erases the
+calling player whatever kind of account it is, and a guest is simply the case
+with no credential to re-confirm. See
+[Erasing your own account](rest-api.md#erasing-your-own-account) for the
+contract; the guest-specific part is only that no `password` is required,
+because a guest has none.
+
+```bash
+curl -X POST http://localhost:8084/api/v1/players/me/erase \
+  -H 'Authorization: Bearer <access_token>' \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+It is the only erasure path that needs no operator secret, which makes it the
+only one a cloud tenant can reach: `guest_reap_after` and the ops erasure route
+are both operator keys a cloud tenant cannot set.
+
+**A device secret is now a destruction credential, not just an impersonation
+one.** Anyone holding it can resume the account and erase it, with no password
+to stop them, because there is no password. That is a deliberate trade - the
+alternative is a guest who can never delete their account - but it raises the
+bar on where a shipping client stores the pair: treat it the way you would treat
+a password, not a cache key.
+
+A device pair written to disk once and reused does not need this route at all,
+and that is what a shipping client should do. A fresh pair per launch is a
+testing trick (see [Testing with multiple
+players](testing-multiple-players.md)), and it is the pattern that accumulates
+accounts.
+
 ### Errors
 
 | Status | `error.code` | Meaning |
@@ -367,9 +399,17 @@ Player id, progress, wallets, and inventory are preserved.
 | `409`  | `guest.not_unclaimed`              | Upgrade target is not an unclaimed guest |
 | `409`  | `auth.username_taken`              | Upgrade username is already in use |
 | `422`  | `validation_failed`                | On upgrade: the new username or password failed validation. `details.fields` is per-field, for a form UI |
+| `429`  | `guest.rate_limited`               | The deployment-wide guest-create limiter is saturated. `details.retry_after` is seconds; retry then |
 | `500`  | `guest.create_failed`              | The player row could not be created |
 | `500`  | `internal`                         | The device resolves to an identity whose player no longer exists, or another server-side failure |
-| `503`  | `guest.capacity_reached`           | Global create limit or the unlinked-guest cap was hit |
+| `503`  | `guest.capacity_reached`           | The unlinked-guest cap is reached. Raise `guest_unlinked_cap`, set `guest_reap_after`, or have clients delete guests they abandon |
+| `503`  | `guest.unavailable`                | The node could not count existing guests, so it refused rather than create without a bound. Not a full deployment - look for a database fault, and check the `guest_create_denied` log line |
+
+The three refusals above are deliberately distinct. Until asobi#419 they shared
+`guest.capacity_reached`, which reported a transient database fault as a
+deployment that was full and gave an operator nothing to act on. Every denial
+now logs `guest_create_denied` with a `reason` and, for the cap, the `count`
+and `cap` it compared.
 
 ### Configuration
 

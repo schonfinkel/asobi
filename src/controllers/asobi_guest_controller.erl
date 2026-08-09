@@ -12,11 +12,16 @@
 %% is configured; both missing/false fail closed. Upgrade to a real account:
 %% POST /auth/guest/upgrade (username+password, revokes the device verifier) or
 %% the existing /auth/link path (OAuth). Guardian + beam-security-reviewer gate.
+%%
+%% Deleting a guest is not here: it is `DELETE /api/v1/players/me`
+%% (`asobi_player_controller:erase_self/1`), because a player erasing their own
+%% account is not a guest-shaped problem. A guest is just the case with no
+%% credential to re-confirm (asobi#419).
 
 -export([authenticate/1, upgrade/1]).
 
 -ifdef(TEST).
--export([make_verifier/1, verify/2, decode_secret/1, valid_device_id/1, create/2]).
+-export([make_verifier/1, verify/2, decode_secret/1, valid_device_id/1, create/2, cap_gate/2]).
 -endif.
 
 -include_lib("kernel/include/logger.hrl").
@@ -36,6 +41,8 @@
 -define(MAX_SECRET_B64_BYTES, 1024).
 -define(MAX_DEVICE_ID_BYTES, 255).
 -define(MAX_USERNAME_ATTEMPTS, 3).
+-define(DEFAULT_UNLINKED_CAP, 100000).
+-define(RATE_LIMITED_HINT_SECONDS, 5).
 
 -spec authenticate(cowboy_req:req()) -> response().
 authenticate(#{json := #{~"device_id" := DeviceId, ~"device_secret" := Secret}} = _Req) when
@@ -226,13 +233,105 @@ create(DeviceId, SecretBin) ->
         {deny, Reason} ->
             asobi_auth_error:registration_denied(Reason);
         ok ->
-            case global_create_allowed() andalso within_unlinked_cap() of
-                false ->
-                    ?LOG_WARNING(#{event => guest_capacity_reached}),
-                    {asobi_error, ~"guest.capacity_reached"};
-                true ->
-                    insert_player_and_identity(DeviceId, SecretBin)
+            case create_gate() of
+                allow ->
+                    insert_player_and_identity(DeviceId, SecretBin);
+                {deny, Report} ->
+                    ?LOG_WARNING(Report#{event => guest_create_denied}),
+                    denial(Report)
             end
+    end.
+
+%% The gate decides *why*; this is the only place a why becomes a code, so
+%% every code is still a literal at its return site (asobi_error_contract_tests
+%% enforces that, and it is the rule that keeps a computed string from ever
+%% becoming one). The report that goes to the log and the object that goes to
+%% the client are the same decision, so they cannot drift.
+-spec denial(map()) -> response().
+denial(#{reason := global_rate_limited}) ->
+    %% Shaped like `m:asobi_rate_limit_plugin`'s own 429 - a `retry-after`
+    %% header and a top-level `retry_after` beside the object's `details`, so an
+    %% SDK backing off on the standard header backs off here too.
+    %%
+    %% A fixed hint, NOT the limiter's real remaining window. This bucket is
+    %% keyed on one constant, so it is the whole node's guest-signup budget: the
+    %% true figure would tell an unauthenticated caller exactly how long to
+    %% sleep between single requests to hold it shut against every real player,
+    %% which is the cheapest possible lockout and has been measured on this
+    %% stack before (asobi_saas#249). The precise number stays in the
+    %% `guest_create_denied` log line, where the operator needs it and an
+    %% attacker cannot read it. The per-IP limiter may publish its real value
+    %% because the attacker already owns that bucket; this one is shared.
+    {json, 429, #{~"retry-after" => integer_to_binary(?RATE_LIMITED_HINT_SECONDS)},
+        asobi_error:legacy_body(~"guest.rate_limited", #{
+            ~"retry_after" => ?RATE_LIMITED_HINT_SECONDS
+        })};
+denial(#{reason := unlinked_cap_reached}) ->
+    {asobi_error, ~"guest.capacity_reached"};
+denial(#{reason := unlinked_count_unavailable}) ->
+    {asobi_error, ~"guest.unavailable"}.
+
+%% No catch-all clause, on purpose. Dialyzer proves this mapping total over
+%% everything `create_gate/0` returns, so a fourth reason added later fails the
+%% build rather than reaching production - a stronger backstop than a
+%% fail-closed clause, which dialyzer would then report as unreachable anyway.
+
+%% Three unrelated conditions refuse a create, and each is a different
+%% operator problem. They used to share one code and one reason-less warning
+%% (asobi#419), so a field report of "capacity reached" could not be diagnosed
+%% from the node at all - and the most likely cause, a repo error while
+%% counting, was reported as a deployment that is full when it was nowhere
+%% near the cap. Fail closed either way, but say which one and log the numbers.
+-spec create_gate() -> allow | {deny, map()}.
+create_gate() ->
+    case seki:check(asobi_guest_global_limiter, ~"global") of
+        {allow, _} ->
+            cap_gate(asobi_guest_reaper:cached_unlinked_count(), cap());
+        {deny, #{retry_after := RetryAfterMs}} ->
+            {deny, #{reason => global_rate_limited, retry_after_ms => RetryAfterMs}}
+    end.
+
+%% Finite by default (fail-closed): the ceiling must not be off by default.
+%% Operators raise it or set `infinity` deliberately. The count is read from a
+%% short-TTL cache (asobi_guest_reaper) rather than COUNT-ing the whole guest
+%% table on every unauthenticated create, so the cap is advisory - a soft
+%% ceiling that can overshoot by up to (TTL x create-rate), not exact.
+%%
+%% Split from the config and count reads so every branch - including the one
+%% that only happens when the database is unreachable - is reachable from a
+%% unit test.
+-spec cap_gate(non_neg_integer() | unknown, non_neg_integer() | infinity) ->
+    allow | {deny, map()}.
+cap_gate(_Count, infinity) ->
+    allow;
+cap_gate(Count, Cap) when is_integer(Count), Count < Cap ->
+    allow;
+cap_gate(Count, Cap) when is_integer(Count) ->
+    {deny, #{reason => unlinked_cap_reached, count => Count, cap => Cap}};
+cap_gate(unknown, Cap) ->
+    %% The count query failed. Still fail closed - an unbounded create path is
+    %% the thing the cap exists to prevent - but this is "the node could not
+    %% find out", not "the node is full", and an operator told the second goes
+    %% looking for a ceiling that is nowhere near reached.
+    {deny, #{reason => unlinked_count_unavailable, cap => Cap}}.
+
+%% An unrecognised value used to fall through the `case` and crash every guest
+%% create with a `case_clause`, which reads as a server fault rather than the
+%% typo it is. Fall back to the default and say so.
+-spec cap() -> non_neg_integer() | infinity.
+cap() ->
+    case application:get_env(asobi, guest_unlinked_cap, ?DEFAULT_UNLINKED_CAP) of
+        infinity ->
+            infinity;
+        Cap when is_integer(Cap), Cap >= 0 ->
+            Cap;
+        Other ->
+            ?LOG_WARNING(#{
+                event => invalid_guest_unlinked_cap,
+                value => Other,
+                using => ?DEFAULT_UNLINKED_CAP
+            }),
+            ?DEFAULT_UNLINKED_CAP
     end.
 
 -spec insert_player_and_identity(binary(), binary()) -> response().
@@ -388,30 +487,6 @@ pepper(KeyId) ->
         Bin when is_binary(Bin), byte_size(Bin) >= 32 -> Bin;
         _ ->
             undefined
-    end.
-
--spec global_create_allowed() -> boolean().
-global_create_allowed() ->
-    case seki:check(asobi_guest_global_limiter, ~"global") of
-        {allow, _} -> true;
-        {deny, _} -> false
-    end.
-
--spec within_unlinked_cap() -> boolean().
-within_unlinked_cap() ->
-    %% Finite by default (fail-closed): the ceiling must not be off by default.
-    %% Operators raise it or set `infinity` deliberately. The count is read from
-    %% a short-TTL cache (asobi_guest_reaper) rather than COUNT-ing the whole
-    %% guest table on every unauthenticated create, so the cap is advisory - a
-    %% soft ceiling that can overshoot by up to (TTL x create-rate), not exact.
-    case application:get_env(asobi, guest_unlinked_cap, 100000) of
-        infinity ->
-            true;
-        Cap when is_integer(Cap) ->
-            case asobi_guest_reaper:cached_unlinked_count() of
-                N when is_integer(N) -> N < Cap;
-                unknown -> false
-            end
     end.
 
 %% --- Helpers ---
