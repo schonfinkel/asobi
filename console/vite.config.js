@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
@@ -16,6 +17,15 @@ import react from '@vitejs/plugin-react';
 export default defineConfig({
   base: '/console/',
   plugins: [react()],
+  resolve: {
+    // The one specifier an extension's console source may import. It resolves
+    // here in this repository's own build and in a host's composed build
+    // alike, so the same .jsx file compiles in both without the extension
+    // knowing which one it is in. See src/public.js.
+    // fileURLToPath rather than the URL's pathname, which on Windows is
+    // /C:/... and resolves to nothing.
+    alias: { '@asobi/console': fileURLToPath(new URL('./src/public.js', import.meta.url)) },
+  },
   build: {
     outDir: '../priv/console',
     emptyOutDir: true,

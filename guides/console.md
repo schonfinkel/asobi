@@ -189,9 +189,11 @@ PlayFab Game Manager or the Hathora console, that expectation gap is real and
 this is where it is.
 
 The third mutating route takes its method, its handler and its capability class
-from an installed extension's manifest. The console cannot invoke it today;
-that surface is HTTP only. See [Extensions](extensions.md) for how an extension
-declares one.
+from an installed extension's manifest. An extension that ships its own
+operator screens calls it from them, in a console composed with
+`rebar3 asobi console` - see
+[Extending the operator console](console-extensions.md). See
+[Extensions](extensions.md) for how an extension declares one.
 
 ## Capability classes
 
@@ -330,7 +332,12 @@ deployment with the console switched off is indistinguishable from one that has
 it on and was asked for a file that does not exist.
 
 **`/console` returns 503.** The console bundle is missing from the release.
-This is a build problem, not a configuration one.
+This is a build problem, not a configuration one. On a host that composes its
+own console, the log says which: `bundle_app_unavailable` means
+`console_bundle_app` names an application the release does not have, and
+`manifest_unreadable` means it has it and `rebar3 asobi console` never wrote a
+bundle into it. See
+[Extending the operator console](console-extensions.md#when-something-does-not-appear).
 
 **The node is up but the console is off.** Grep the boot log for
 `console_disabled_without_credential`, `ops_secret_file_unreadable` and
@@ -354,3 +361,5 @@ front of more than one node. Make the route sticky.
   without an operator secret.
 - [Clustering](clustering.md) - what is per node.
 - [Extensions](extensions.md) - declaring an operator action.
+- [Extending the operator console](console-extensions.md) - adding screens for
+  one, and building the console that carries them.

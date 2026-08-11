@@ -241,5 +241,64 @@ enabled_only_by_true_test() ->
         restore(console, Was)
     end.
 
+%%--------------------------------------------------------------------
+%% Which application's bundle is served
+%%
+%% A host whose extensions ship console screens composes its own bundle with
+%% `rebar3 asobi console` and points `console_bundle_app` at the application it
+%% was written into. Getting that wrong must not quietly serve asobi's own
+%% bundle: the screens the host built the thing for are exactly the ones that
+%% would be missing, with nothing saying so.
+%%--------------------------------------------------------------------
+
+serves_asobis_own_bundle_when_unconfigured_test() ->
+    Was = application:get_env(asobi, console_bundle_app),
+    application:unset_env(asobi, console_bundle_app),
+    asobi_console:reset(),
+    try
+        ?assertMatch({ok, #{script := <<"main-", _/binary>>}}, asobi_console:bundle())
+    after
+        restore(console_bundle_app, Was),
+        asobi_console:reset()
+    end.
+
+refuses_a_bundle_app_that_is_not_in_the_release_test() ->
+    Was = application:get_env(asobi, console_bundle_app),
+    application:unset_env(asobi, console_bundle_app),
+    asobi_console:reset(),
+    try
+        %% The entry the committed bundle actually holds, read rather than
+        %% written down: an asset name that is already absent would make the
+        %% negative assertion below pass with no fallback to catch.
+        {ok, #{script := Script}} = asobi_console:bundle(),
+        ?assertMatch({ok, _}, asobi_console:asset(Script)),
+
+        asobi_console:reset(),
+        application:set_env(asobi, console_bundle_app, no_such_application),
+        ?assertEqual(
+            {error, {bundle_app_unavailable, no_such_application}},
+            asobi_console:bundle()
+        ),
+        %% And nothing is reachable through it either, rather than falling
+        %% through to whatever asobi's own bundle holds under the same name.
+        ?assertEqual(error, asobi_console:asset(Script))
+    after
+        restore(console_bundle_app, Was),
+        asobi_console:reset()
+    end.
+
+%% The doc promises a mistyped value is the same legible 503 as a missing
+%% application, rather than a crash inside a request.
+refuses_a_bundle_app_that_is_not_an_atom_test() ->
+    Was = application:get_env(asobi, console_bundle_app),
+    asobi_console:reset(),
+    try
+        application:set_env(asobi, console_bundle_app, ~"asobi"),
+        ?assertEqual({error, {bundle_app_unavailable, ~"asobi"}}, asobi_console:bundle())
+    after
+        restore(console_bundle_app, Was),
+        asobi_console:reset()
+    end.
+
 restore(Key, {ok, Value}) -> application:set_env(asobi, Key, Value);
 restore(Key, undefined) -> application:unset_env(asobi, Key).
