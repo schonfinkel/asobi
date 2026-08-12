@@ -27,9 +27,9 @@ for _, wallet in ipairs(result.ok) do
 end
 ```
 
-The plain calls - `broadcast`, `send`, `chat.send`, `zone.spawn`,
-`zone.despawn`, `terrain.preload`, `leaderboard.submit`, `spatial.*` - return
-their value directly:
+The plain calls - `broadcast`, `send`, `chat.send`, `match.set_joinable`,
+`bots.add`, `bots.remove`, `zone.spawn`, `zone.despawn`, `terrain.preload`,
+`leaderboard.submit`, `spatial.*` - return their value directly:
 
 ```lua
 local hits = game.spatial.query_radius(state.entities, 100, 100, 50)
@@ -96,6 +96,72 @@ in one event.
 `send` reaches the client as a `module.message` frame carrying
 `{"module": "lua", "message": ...}`, which is why it takes any Lua value rather
 than a table. See [WebSocket protocol](websocket-protocol.md).
+
+## Match
+
+```lua
+game.match.set_joinable(open)            -- open or close the match to new joins
+```
+
+Match only - a world or zone script gets `{ error = "..." }` back, because the
+call would otherwise reach the world server. A closed match keeps running and
+keeps everyone already in it; the next player to try is answered
+`match.locked`, and `match.list` reports it with `joinable = false` so a
+browser can leave it out.
+
+There is no config key and no default to set: a match opens joinable and the
+game closes it when the game decides. An Erlang game module does the same
+thing with `asobi_match_server:set_joinable(self(), false)` - its callbacks
+run in the match process, so `self()` is the match.
+
+This is the runtime half of joinability. `listed` decides whether a match is
+advertised at all, and an unlisted match is still joinable by id - hiding a
+match is not closing it.
+
+```lua
+function tick(state)
+    if state.round > 1 then
+        game.match.set_joinable(false)   -- no backfill past round one
+    end
+    return state
+end
+```
+
+Asynchronous, like `broadcast`: a join already in the mailbox ahead of the flag
+still gets in. Closing a match stops the next joiner, not one already through
+the door. To refuse a specific player instead, return `nil` from
+[`join`](lua-scripting.md#refusing-a-join).
+
+## Bots
+
+```lua
+game.bots.add(name)                      -- place a bot in this match
+game.bots.remove(bot_id)                 -- take one out
+```
+
+Match only - a world or zone script gets `{ error = "..." }` back. `name` is
+bare and gets the `bot_` prefix every bot id carries, so
+`game.bots.add("Spark")` puts `bot_Spark` in the roster; `remove` accepts either
+form. Names are 1-32 characters of `[A-Za-z0-9_-]`.
+
+This is the script-driven route in. The other one is queue fill - `bots.enabled`
+on a game mode, which tops the *matchmaker queue* up before a match exists (see
+[Bots](lua-bots.md)). The two are independent: leave `bots.enabled` off and
+nothing arrives that your script did not ask for.
+
+```lua
+function tick(state)
+    if state.humans_waiting and count(state.players) < 4 then
+        game.bots.add("Spark")
+    end
+    return state
+end
+```
+
+Both are asynchronous and neither reports failure at the call site: a match that
+is full, already holds that bot, or is at the 64-bot ceiling is a no-op with a
+line in the node log. A bot runs the mode's `bots.script` if it has one and the
+built-in AI otherwise.
 
 ## Economy
 
