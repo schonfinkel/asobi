@@ -45,6 +45,18 @@ zone_test_() ->
         {"tick processes inputs and broadcasts deltas", fun tick_broadcasts/0},
         {"tick with no changes sends no deltas", fun tick_no_changes/0},
         {"tick acks to ticker", fun tick_acks/0},
+        {"world.input seq comes back as a world.ack (#474)", fun world_ack_returns_seq/0},
+        {"a rejected input still advances the world.ack (#474)",
+            fun world_ack_advances_on_reject/0},
+        {"world.input without a seq produces no world.ack (#474)",
+            fun world_ack_absent_without_seq/0},
+        {"world.ack keeps the highest seq (#474)", fun world_ack_keeps_highest_seq/0},
+        {"world.ack is per-connection - p1's ack never reaches p2 (#474)",
+            fun world_ack_is_per_connection/0},
+        {"a negative seq is ignored - no ack (#474 hardening)",
+            fun world_ack_ignores_negative_seq/0},
+        {"a non-integer seq via player_input/4 does not crash the zone (#474 hardening)",
+            fun world_ack_survives_non_integer_seq/0},
         {"queued inputs apply in arrival order", fun inputs_apply_in_arrival_order/0},
         {"subscriber DOWN cleans up", fun subscriber_down_cleanup/0},
         {"tick touches zone_manager when subscribers present", fun tick_touches_zone_manager/0},
@@ -197,6 +209,114 @@ subscribe_unsubscribe() ->
     timer:sleep(10),
     ?assertEqual(0, asobi_zone:get_subscriber_count(Pid)),
     gen_server:stop(Pid).
+
+%% asobi#474: a world.input carrying a client seq comes back to that connection
+%% as a world.ack, so the client can reconcile its prediction.
+world_ack_returns_seq() ->
+    Pid = start_zone(#{broadcast_interval => 1}),
+    asobi_zone:subscribe(Pid, {~"p1", self()}),
+    asobi_zone:add_entity(Pid, ~"p1", #{x => 0, y => 0, type => ~"player"}),
+    timer:sleep(10),
+    flush_messages(),
+    asobi_zone:player_input(Pid, ~"p1", #{~"action" => ~"move", ~"x" => 5, ~"y" => 5}, 412),
+    asobi_zone:tick(Pid, 1),
+    ?assertEqual(412, recv_ack()),
+    gen_server:stop(Pid).
+
+%% A rejected input still advances the ack: the server consumed the seq, it just
+%% declined the effect. With no p1 entity the move is rejected (not_found).
+world_ack_advances_on_reject() ->
+    Pid = start_zone(#{broadcast_interval => 1}),
+    asobi_zone:subscribe(Pid, {~"p1", self()}),
+    timer:sleep(10),
+    flush_messages(),
+    asobi_zone:player_input(Pid, ~"p1", #{~"action" => ~"move", ~"x" => 1, ~"y" => 1}, 7),
+    asobi_zone:tick(Pid, 1),
+    ?assertEqual(7, recv_ack()),
+    gen_server:stop(Pid).
+
+%% A client that never stamps a seq (did not opt in) gets no ack frames.
+world_ack_absent_without_seq() ->
+    Pid = start_zone(#{broadcast_interval => 1}),
+    asobi_zone:subscribe(Pid, {~"p1", self()}),
+    asobi_zone:add_entity(Pid, ~"p1", #{x => 0, y => 0, type => ~"player"}),
+    timer:sleep(10),
+    flush_messages(),
+    asobi_zone:player_input(Pid, ~"p1", #{~"action" => ~"move", ~"x" => 3, ~"y" => 3}),
+    asobi_zone:tick(Pid, 1),
+    ?assertEqual(no_ack, recv_ack()),
+    gen_server:stop(Pid).
+
+%% Out-of-order or duplicate seqs never regress the ack: the highest wins.
+world_ack_keeps_highest_seq() ->
+    Pid = start_zone(#{broadcast_interval => 1}),
+    asobi_zone:subscribe(Pid, {~"p1", self()}),
+    timer:sleep(10),
+    flush_messages(),
+    asobi_zone:player_input(Pid, ~"p1", #{}, 5),
+    asobi_zone:player_input(Pid, ~"p1", #{}, 3),
+    asobi_zone:tick(Pid, 1),
+    ?assertEqual(5, recv_ack()),
+    gen_server:stop(Pid).
+
+%% asobi#474: the ack is per-connection - p1's seq reaches p1 only, never p2's
+%% connection. That isolation is the whole point of the frame over the shared
+%% entity-field ack.
+world_ack_is_per_connection() ->
+    Parent = self(),
+    Pid = start_zone(#{broadcast_interval => 1}),
+    P2 = spawn(fun() -> p2_ack_forwarder(Parent) end),
+    asobi_zone:subscribe(Pid, {~"p1", self()}),
+    asobi_zone:subscribe(Pid, {~"p2", P2}),
+    asobi_zone:add_entity(Pid, ~"p1", #{x => 0, y => 0, type => ~"player"}),
+    timer:sleep(10),
+    flush_messages(),
+    asobi_zone:player_input(Pid, ~"p1", #{~"action" => ~"move", ~"x" => 2, ~"y" => 2}, 99),
+    asobi_zone:tick(Pid, 1),
+    ?assertEqual(99, recv_ack()),
+    receive
+        {p2_saw_ack, S} ->
+            ?assert(false, "p2 received a world.ack for p1's seq: " ++ integer_to_list(S))
+    after 100 -> ok
+    end,
+    gen_server:stop(Pid).
+
+p2_ack_forwarder(Parent) ->
+    receive
+        {asobi_message, {world_ack, _T, S}} -> Parent ! {p2_saw_ack, S};
+        _ -> p2_ack_forwarder(Parent)
+    end.
+
+%% asobi#474 hardening: record_ack is total and rejects negatives, so a
+%% spec-violating seq reaching the exported player_input/4 neither acks nor
+%% crashes the shared zone process (which would DoS every player in it).
+world_ack_ignores_negative_seq() ->
+    Pid = start_zone(#{broadcast_interval => 1}),
+    asobi_zone:subscribe(Pid, {~"p1", self()}),
+    timer:sleep(10),
+    flush_messages(),
+    asobi_zone:player_input(Pid, ~"p1", #{}, -5),
+    asobi_zone:tick(Pid, 1),
+    ?assertEqual(no_ack, recv_ack()),
+    ?assert(is_process_alive(Pid)),
+    gen_server:stop(Pid).
+
+world_ack_survives_non_integer_seq() ->
+    Pid = start_zone(#{broadcast_interval => 1}),
+    asobi_zone:subscribe(Pid, {~"p1", self()}),
+    timer:sleep(10),
+    flush_messages(),
+    asobi_zone:player_input(Pid, ~"p1", #{}, ~"not-a-seq"),
+    asobi_zone:tick(Pid, 1),
+    ?assertEqual(no_ack, recv_ack()),
+    ?assert(is_process_alive(Pid)),
+    gen_server:stop(Pid).
+
+recv_ack() ->
+    receive
+        {asobi_message, {world_ack, _Tick, Seq}} -> Seq
+    after 300 -> no_ack
+    end.
 
 %% widgrensit/asobi#293: leaving a zone's interest ring must mirror joining
 %% it - subscribe_new/3 sends an `a` for every entity, so unsubscribe must
