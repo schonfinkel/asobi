@@ -611,6 +611,10 @@ configure_zone_manager(
         spawn_templates => Templates,
         persistence => Persistence,
         snapshot_interval => maps:get(snapshot_interval, Config, 600),
+        %% Default 3, so at the 50ms tick_rate deltas go out every 150ms even
+        %% though the sim runs at tick_rate; a mode sets `broadcast_interval` to
+        %% 1 for a delta every tick (tightest correction latency for prediction).
+        broadcast_interval => maps:get(broadcast_interval, Config, 3),
         zone_manager_pid => ZoneManagerPid,
         terrain_store_pid => TerrainStorePid,
         %% So a zone can decide crossings with the same clamped math - see
