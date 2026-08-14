@@ -53,6 +53,8 @@ zone_test_() ->
         {"world.ack keeps the highest seq (#474)", fun world_ack_keeps_highest_seq/0},
         {"world.ack is per-connection - p1's ack never reaches p2 (#474)",
             fun world_ack_is_per_connection/0},
+        {"a straggler input re-arms the zone's ack after the entity left (#477)",
+            fun world_ack_rearms_in_the_zone_left_behind/0},
         {"a negative seq is ignored - no ack (#474 hardening)",
             fun world_ack_ignores_negative_seq/0},
         {"a non-integer seq via player_input/4 does not crash the zone (#474 hardening)",
@@ -286,6 +288,33 @@ p2_ack_forwarder(Parent) ->
         {asobi_message, {world_ack, _T, S}} -> Parent ! {p2_saw_ack, S};
         _ -> p2_ack_forwarder(Parent)
     end.
+
+%% asobi#477: this pins the zone-side behaviour the session-side filter exists to
+%% correct. A crossing player stays subscribed to the zone they left whenever it
+%% remains in their interest ring, and input still routed there during the
+%% crossing re-arms the ack, so the zone goes on emitting a mark that the zone
+%% they moved into has already passed. The zone cannot know that on its own -
+%% only the connection sees both streams - which is why asobi_player_session
+%% drops any ack that does not advance. If this test ever starts reporting
+%% no_ack, the zone has grown a guard and the session filter may be redundant.
+world_ack_rearms_in_the_zone_left_behind() ->
+    Pid = start_zone(#{broadcast_interval => 1}),
+    asobi_zone:subscribe(Pid, {~"p1", self()}),
+    asobi_zone:add_entity(Pid, ~"p1", #{x => 0, y => 0, type => ~"player"}),
+    timer:sleep(10),
+    flush_messages(),
+    asobi_zone:player_input(Pid, ~"p1", #{~"action" => ~"move", ~"x" => 5, ~"y" => 5}, 412),
+    asobi_zone:tick(Pid, 1),
+    ?assertEqual(412, recv_ack()),
+    %% The straggler: cast before the crossing lands, drained on the next tick.
+    asobi_zone:player_input(Pid, ~"p1", #{~"action" => ~"move", ~"x" => 6, ~"y" => 6}, 413),
+    asobi_zone:remove_entity(Pid, ~"p1"),
+    flush_messages(),
+    asobi_zone:tick(Pid, 2),
+    ?assertEqual(413, recv_ack()),
+    asobi_zone:tick(Pid, 3),
+    ?assertEqual(413, recv_ack()),
+    gen_server:stop(Pid).
 
 %% asobi#474 hardening: record_ack is total and rejects negatives, so a
 %% spec-violating seq reaching the exported player_input/4 neither acks nor

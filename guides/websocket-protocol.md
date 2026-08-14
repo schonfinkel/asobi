@@ -284,6 +284,17 @@ Send game input to the match server.
 {"type": "match.input", "payload": {"action": "move", "x": 10, "y": 5}}
 ```
 
+As with [`world.input`](#worldinput), the `payload` IS the input map. Two
+**deprecated** compatibility shapes survive here and will go at the next
+protocol break: a payload whose only key is `data` mapped to an object is
+unwrapped to that object, and one whose only key is `data` mapped to a JSON
+*string* is decoded and unwrapped. A malformed string, a decoded value that is
+not an object, or a `payload` that is not an object at all is answered with
+`error`, reason `invalid_payload`.
+
+When the connection is in a world rather than a match, `match.input` is routed
+to your zone, so the two frames reach the same `handle_input/3`.
+
 Input sent while not in a match or world is dropped. The first drop (at
 most one per 5 seconds per connection) is answered with an error event so
 the client can tell input is going nowhere:
@@ -614,9 +625,19 @@ Join a specific world by id (e.g. one returned from `world.list`).
 
 ### `world.input`
 
-Send game input to your zone. The `payload` IS the input map - there is
-no inner `data` wrapper. Field names are entirely up to your game; the
-server only forwards the map verbatim to your `handle_input/3` callback.
+Send game input to your zone. The `payload` IS the input map; the server
+forwards it verbatim to your `handle_input/3` callback and field names are
+entirely up to your game.
+
+One **deprecated** compatibility shape survives: a payload whose *only* key is
+`data`, mapped to an object, is unwrapped to that object. It exists for clients
+that predate this rule and will be removed at the next protocol break; do not
+send it. A `data` key alongside any other key is not special, and neither is a
+`data` whose value is not an object - both reach `handle_input/3` untouched,
+with the rest of the payload intact.
+
+A `payload` that is not an object at all is rejected with an `error` frame,
+reason `invalid_payload`. It is not silently treated as empty input.
 
 For client-side prediction, add an optional `seq` *alongside* `payload` (a
 sibling, so "the payload IS the input map" stays true). The server echoes the
@@ -680,16 +701,22 @@ authoritative state already includes - is a first-class primitive:
    of `payload`) and applies the input locally right away (the prediction).
 2. The server records the highest `seq` it consumed for that player - a rejected
    input still counts, so a dropped input never strands the client - and sends it
-   back on the next broadcast as a per-connection
-   [`world.ack`](#worldack-server-push).
+   back on the next broadcast as a [`world.ack`](#worldack-server-push)
+   addressed to that connection alone.
 3. The client discards every predicted input up to that `seq` and replays the
    rest on top of the authoritative `world.tick` state (the reconciliation).
 
 Set [`broadcast_interval`](world-server.md) to 1 so the ack returns every tick.
 
-The ack is per-connection: it is sent only to clients that opted in by stamping a
-`seq`, and never rides the shared `world.tick`, so one player's input stream is
-never broadcast to the rest of the zone.
+The ack is addressed to one connection: it is sent only to clients that opted in
+by stamping a `seq`, and never rides the shared `world.tick`, so one player's
+input stream is never broadcast to the rest of the zone.
+
+**`seq` never goes backwards on a connection.** The high-water mark is recorded
+per zone, and a player is subscribed to their whole interest ring, so during a
+crossing more than one zone can hold a mark for them. The connection drops any
+ack that does not advance the highest `seq` it has already sent you, so you can
+prune against the value you receive without tracking a maximum yourself.
 
 **If your SDK does not yet surface `world.ack`**, the same reconciliation works
 in userland: write the `seq` onto the player's entity in `handle_input/3`
@@ -700,9 +727,10 @@ is exactly what the `world.ack` frame avoids.
 
 ### `world.ack` (server push)
 
-Per-connection acknowledgement of the highest `world.input` `seq` the server has
-consumed for you as of `tick`. Sent only to clients that stamped a `seq` on their
-input; use it to reconcile prediction (above).
+Acknowledgement of the highest `world.input` `seq` the server has consumed for
+you as of `tick`, and monotonic for the life of the connection. Addressed to your
+connection alone, and sent only to clients that stamped a `seq` on their input;
+use it to reconcile prediction (above).
 
 ```json
 {"type": "world.ack", "payload": {"tick": 42, "seq": 412}}

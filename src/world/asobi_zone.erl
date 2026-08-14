@@ -761,8 +761,11 @@ broadcast_deltas(TickN, Deltas, Subs) ->
         Subs
     ).
 
-%% asobi#474: per-connection input ack. Iterate the opted-in players (those with
-%% a recorded seq) and send world.ack only to the ones still subscribed. Kept
+%% asobi#474: input ack, addressed to one connection. Iterate the opted-in
+%% players (those with a recorded seq) and send world.ack only to the ones still
+%% subscribed. The mark is per zone, so a crossing player can be acked by both
+%% the zone they left and the one they entered; asobi_player_session drops any
+%% ack that does not advance, which is what makes the frame monotonic. Kept
 %% off the shared world.tick binary so the ack never leaks one player's input
 %% stream to the rest of the zone.
 -spec broadcast_acks(non_neg_integer(), #{binary() => non_neg_integer()}, map()) -> ok.
