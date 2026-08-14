@@ -25,9 +25,32 @@ A waiting match is the cheaper shape, but the row above that decides it is
 A match starts in the `waiting` state and transitions to `running` when
 `min_players` is reached. That waiting period is the lobby.
 
-**No client-facing call brings a match into existence.** The matchmaker is the
-only creator: it groups co-queued tickets and spawns. There is no `match.create`
-frame and no `POST /api/v1/matches`.
+**`match.find_or_create` is the client-facing route into a live match.** Send a
+mode; the server returns the first listed match of that mode with room that is
+still accepting players, and spawns one if there is none. The reply is
+`match.joined`, the same frame `match.join` answers with.
+
+```json
+{"type": "match.find_or_create", "cid": "1", "payload": {"mode": "arena"}}
+```
+
+Opt in with `quick_play = true`. It defaults to `false` for match modes, so a
+ranked mode the matchmaker owns is refused with `quick_play_disabled` until you
+say otherwise - and a mode written before this frame existed is safe on upgrade
+without touching it.
+
+`quick_play` and `listed` are independent: `listed` decides whether a match
+appears in `match.list`, `quick_play` decides whether a player may be dropped
+into an existing one. Hidden but auto-filled is a legitimate combination.
+
+Prefer it over `match.list` then `match.join`. Browsing and then joining is two
+round trips with a race in the middle: two clients that both read an empty list
+both create, and you get two half-empty matches that may each fail to reach
+`min_players`. `find_or_create` resolves server-side, serialized, so
+simultaneous callers land in the same match.
+
+There is still no bare `match.create`, and no `POST /api/v1/matches`. Creating a
+match without reusing one is what the matchmaker is for.
 
 But the waiting state is reachable from mode config. Declare a `min_players`
 higher than `match_size` and the matchmaker spawns on the group it formed while
@@ -151,8 +174,8 @@ Worlds are subject to `world_max_per_player` (5) and `world_max` (1000) - see
 
 ### Private lobbies
 
-Because only a world can be created by a client, a code-gated private lobby is a
-world too. Share a code out of band and check it on the way in. The join context
+A code-gated private lobby can be a match as well as a world: `match.find_or_create`
+forwards the join context, so a `join` callback can refuse on a bad code. Share a code out of band and check it on the way in. The join context
 is whatever the client put in the join payload; asobi never reads it.
 
 ```lua
