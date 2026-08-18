@@ -125,8 +125,9 @@ frame that happens to arrive.
 Asking for binary changes `world.tick` and nothing else. `world.ack`,
 `world.terrain`, `match.*`, `module.*` and every `error` stay JSON text on both
 wires, so a binary client is one that handles both frame types, not one that
-stops handling text. A frame the server cannot encode as binary (an entity field
-holding a list or a nested map, for instance) also arrives as text.
+stops handling text. A frame the server cannot encode as binary also arrives as
+text: an entity field holding a list or a nested map, or a frame needing more
+than the 32 field names the dictionary can index.
 
 The uplink is text-only on both wires. A binary frame sent to the server answers
 `error` with reason `binary_uplink_unsupported`.
@@ -820,6 +821,32 @@ A `2` frame is the leave-removal list, and it is applied ungated.
 `x, y, vx, vy` pay for four names rather than a hundred and sixty. The frame is
 self-describing: nothing is negotiated up front and nothing survives a
 reconnect.
+
+**Five bits of index means a frame carries at most 32 distinct field names**, and
+this is a budget worth knowing before you hit it. It is counted across the whole
+frame, not per entity, but one entity is what usually spends it: a delta names
+only the fields that changed, while the `add` that introduces an entity names all
+of them. An entity with 33 fields therefore cannot ride this wire at all.
+
+A frame past the budget is sent as text instead. That is safe for the frame and
+not safe on its own for what follows: **a text add carries no slot**, so the
+entities it introduced are not in your table, and the next binary frame names
+them in `op:"u"` records you have to drop - with a contiguous `frame_seq` that
+gives you no reason to resync.
+
+So the server repairs it rather than leaving it to you. The frame after a refused
+one is a **keyframe** - `kf: true`, all adds - which re-establishes every binding.
+Nothing is required of a client that already applies keyframes the way this guide
+describes. If that keyframe is refused too, the cause is the shape of the game's
+entities rather than one frame, and the zone gives the binary wire up for its
+life: every client on it falls back to text, which carries everything, and the
+datagram plane switches off with it.
+
+Both outcomes are visible server-side, and neither is silent on the client's
+behalf. If a game seems to be missing the datagram plane, count the fields on its
+widest entity and look for `binary world.tick frame refused` or
+`binary wire disabled for this zone` in the server log; both name the zone, the
+distinct-name count and the widest entity.
 
 **Entities are 2-byte slots, and the slot is scoped to the zone.** A record
 carries the full entity id on an **add only**, which is where the binding is

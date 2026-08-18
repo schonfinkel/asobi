@@ -29,11 +29,24 @@ TCP.
 -export([start_link/0, enabled/0, register/1, unregister/1, pose/2, connected/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
+-include_lib("kernel/include/logger.hrl").
+
 -define(RECONNECT_MS, 2_000).
 -define(CONNECT_TIMEOUT_MS, 2_000).
 -define(NONCE_BYTES, 16).
 
--type state() :: #{socket := gen_tcp:socket() | undefined, buffer := binary()}.
+%% At most one dial-failure warning per minute. Reconnects are two seconds apart,
+%% so an unreachable gateway is 30 lines a minute un-throttled - and the failure
+%% it has to report is a permanent one (a wrong address, a link port bound to a
+%% loopback the engine is not on), which is exactly the case where a flood buries
+%% the line that says so.
+-define(DIAL_LOG_INTERVAL_MS, 60_000).
+
+-type state() :: #{
+    socket := gen_tcp:socket() | undefined,
+    buffer := binary(),
+    dial_logged_at := integer() | undefined
+}.
 
 -doc """
 Whether this engine has a gateway to talk to.
@@ -105,7 +118,7 @@ unregister(ConnId) ->
 -spec init([]) -> {ok, state()}.
 init([]) ->
     self() ! connect,
-    {ok, #{socket => undefined, buffer => <<>>}}.
+    {ok, #{socket => undefined, buffer => <<>>, dial_logged_at => undefined}}.
 
 -type request() :: connected | {send, asobi_dgram_link:message()}.
 
@@ -164,12 +177,42 @@ connect(State) ->
             case dial(Host, Port) of
                 {ok, Socket} ->
                     asobi_telemetry:dgram_link_up(),
-                    State#{socket => Socket};
+                    State#{socket => Socket, dial_logged_at => undefined};
                 {error, Reason} ->
                     asobi_telemetry:dgram_link_error(Reason),
                     _ = erlang:send_after(?RECONNECT_MS, self(), connect),
-                    State#{socket => undefined}
+                    log_dial_failure(Host, Port, Reason, State#{socket => undefined})
             end
+    end.
+
+%% A telemetry counter was the only thing this emitted, so an engine that could
+%% not reach its gateway looked exactly like one with no gateway configured: every
+%% client was answered `datagram_unavailable` and no log on either side said why
+%% (asobi#511). The gateway binds its link port on loopback, so the two roles have
+%% to share a network namespace; that is the first thing to check and the line
+%% says so.
+-spec log_dial_failure(term(), inet:port_number(), term(), state()) -> state().
+log_dial_failure(Host, Port, Reason, #{dial_logged_at := At} = State) ->
+    %% Monotonic, not system time: a clock stepped backwards over an NTP
+    %% correction would suppress the line for the size of the step. `undefined`
+    %% rather than 0 for the same reason - monotonic time can start negative.
+    Now = erlang:monotonic_time(millisecond),
+    case At =:= undefined orelse Now - At >= ?DIAL_LOG_INTERVAL_MS of
+        false ->
+            State;
+        true ->
+            ?LOG_WARNING(#{
+                msg => ~"dgram link unreachable, datagram plane is down",
+                %% Not `list_to_binary/1`: `dgram_gateway` can also be written
+                %% into sys.config by hand, where a binary host is the natural
+                %% form, and raising here would take the plane's supervisor down
+                %% on the one path that only runs when something is already wrong.
+                host => iolist_to_binary(io_lib:format("~ts", [Host])),
+                port => Port,
+                error => Reason,
+                detail => ~"the gateway binds its link port on loopback only"
+            }),
+            State#{dial_logged_at => Now}
     end.
 
 dial(Host, Port) ->

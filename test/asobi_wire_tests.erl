@@ -88,6 +88,164 @@ too_many_distinct_field_names_is_refused_test() ->
         asobi_wire:encode(F#{records => [#{op => update, slot => 1, gen => 0, fields => Ok}]})
     ).
 
+%% asobi#509. A Luerl table hands the zone whichever key form the game script
+%% wrote, and an atom one reached `byte_size/1` and killed the zone gen_server
+%% mid-tick - taking every subscriber's session with it. Atoms are the form the
+%% text wire already renders as a plain JSON key, so the two wires agree.
+atom_field_names_encode_as_their_text_form_test() ->
+    Atoms = frame([#{op => update, slot => 1, gen => 0, fields => #{type => 7, ~"x" => 1.0}}]),
+    Binaries = frame([
+        #{op => update, slot => 1, gen => 0, fields => #{~"type" => 7, ~"x" => 1.0}}
+    ]),
+    ?assertEqual(asobi_wire:encode(Binaries), asobi_wire:encode(Atoms)),
+    {ok, Bin} = asobi_wire:encode(Atoms),
+    ?assertMatch({ok, #{records := [#{fields := #{~"type" := 7}}]}}, asobi_wire:decode(Bin)).
+
+%% The invariant the length checks exist for, and the one the module was missing:
+%% `encode/1` must never hand back bytes `decode/1` will not take. Erlang's bit
+%% syntax truncates rather than raising, so an over-long name, id or string used to
+%% produce a frame read at the wrong offset from that byte on - `{ok, Bytes}` from
+%% the encoder and a discarded frame on the client, which is corruption the server
+%% never hears about.
+encode_never_produces_bytes_decode_rejects_test() ->
+    Long = binary:copy(~"a", 300),
+    Huge = binary:copy(~"b", 70_000),
+    Frames = [
+        frame([#{op => update, slot => 1, gen => 0, fields => #{Long => 1.0}}]),
+        frame([#{op => add, slot => 1, gen => 0, id => Long, fields => #{~"x" => 1.0}}]),
+        frame([#{op => update, slot => 1, gen => 0, fields => #{~"s" => Huge}}])
+    ],
+    [
+        ?assertMatch({ok, _}, asobi_wire:decode(Bin))
+     || F <- Frames, {ok, Bin} <- [asobi_wire:encode(F)]
+    ],
+    ?assertEqual({error, bad_field_name}, asobi_wire:encode(hd(Frames))),
+    ?assertEqual({error, bad_entity_id}, asobi_wire:encode(lists:nth(2, Frames))),
+    ?assertEqual({error, value_too_large}, asobi_wire:encode(lists:nth(3, Frames))).
+
+%% The boundaries are where they say they are: the dictionary and the id both
+%% count their length in one byte, and a string value in two.
+length_limits_are_inclusive_test() ->
+    Name = binary:copy(~"a", 255),
+    ?assertMatch(
+        {ok, _},
+        asobi_wire:encode(
+            frame([#{op => update, slot => 1, gen => 0, fields => #{Name => 1.0}}])
+        )
+    ),
+    Id = binary:copy(~"i", 255),
+    ?assertMatch(
+        {ok, _},
+        asobi_wire:encode(
+            frame([#{op => add, slot => 1, gen => 0, id => Id, fields => #{~"x" => 1.0}}])
+        )
+    ),
+    Str = binary:copy(~"s", 65_535),
+    ?assertMatch(
+        {ok, _},
+        asobi_wire:encode(
+            frame([#{op => update, slot => 1, gen => 0, fields => #{~"s" => Str}}])
+        )
+    ),
+    %% One byte past each is the refusal, so the boundary is exact rather than
+    %% approximately right.
+    ?assertEqual(
+        {error, bad_field_name},
+        asobi_wire:encode(
+            frame([
+                #{op => update, slot => 1, gen => 0, fields => #{binary:copy(~"a", 256) => 1.0}}
+            ])
+        )
+    ),
+    ?assertEqual(
+        {error, bad_entity_id},
+        asobi_wire:encode(
+            frame([
+                #{
+                    op => add,
+                    slot => 1,
+                    gen => 0,
+                    id => binary:copy(~"i", 256),
+                    fields => #{~"x" => 1.0}
+                }
+            ])
+        )
+    ),
+    ?assertEqual(
+        {error, value_too_large},
+        asobi_wire:encode(
+            frame([
+                #{
+                    op => update,
+                    slot => 1,
+                    gen => 0,
+                    fields => #{~"s" => binary:copy(~"s", 65_536)}
+                }
+            ])
+        )
+    ).
+
+%% An atom key is bounded by the same 255 bytes a binary one is, and an atom of 255
+%% CHARACTERS can be four times that in UTF-8 - so the check has to be on the
+%% rendered text rather than on the atom.
+atom_field_name_past_the_limit_refuses_the_frame_test() ->
+    Wide = list_to_atom(lists:duplicate(200, 16#4E2D)),
+    F = frame([#{op => update, slot => 1, gen => 0, fields => #{Wide => 1.0}}]),
+    ?assert(byte_size(atom_to_binary(Wide, utf8)) > 255),
+    ?assertEqual({error, bad_field_name}, asobi_wire:encode(F)),
+    %% The boundary is where it says it is, on the rendered bytes: 85 three-byte
+    %% characters is exactly 255, one ASCII character more is 256.
+    Exact = list_to_atom(lists:duplicate(85, 16#4E2D)),
+    ?assertEqual(255, byte_size(atom_to_binary(Exact, utf8))),
+    ?assertMatch(
+        {ok, _},
+        asobi_wire:encode(frame([#{op => update, slot => 1, gen => 0, fields => #{Exact => 1.0}}]))
+    ),
+    Over = list_to_atom(lists:duplicate(85, 16#4E2D) ++ "a"),
+    ?assertEqual(256, byte_size(atom_to_binary(Over, utf8))),
+    ?assertEqual(
+        {error, bad_field_name},
+        asobi_wire:encode(frame([#{op => update, slot => 1, gen => 0, fields => #{Over => 1.0}}]))
+    ),
+    %% ...and one that fits still encodes, so the bound is on length not on atoms.
+    Narrow = list_to_atom(lists:duplicate(80, 16#4E2D)),
+    ?assertMatch(
+        {ok, _},
+        asobi_wire:encode(frame([#{op => update, slot => 1, gen => 0, fields => #{Narrow => 1.0}}]))
+    ).
+
+%% asobi#509 again, one branch below where it was fixed. The entity id reaches
+%% `byte_size/1` too, and a Lua table that mixes named and numeric keys hands the
+%% zone a non-binary one - so this raised, and the zone died mid-tick.
+non_binary_entity_id_refuses_the_frame_test() ->
+    F = frame([#{op => add, slot => 1, gen => 0, id => 5.0, fields => #{~"x" => 1.0}}]),
+    ?assertEqual({error, bad_entity_id}, asobi_wire:encode(F)).
+
+%% A record with no `fields` at all is legal on both wires - an add for an entity
+%% with an empty state, and every remove. Normalising must leave those alone
+%% rather than treating the absent key as an empty one it then has to rebuild.
+records_without_fields_survive_normalisation_test() ->
+    Add = frame([#{op => add, slot => 1, gen => 0, id => ~"e1"}]),
+    ?assertEqual({ok, Add}, roundtrip(Add)),
+    Remove = frame([#{op => remove, slot => 1, gen => 0}]),
+    ?assertEqual({ok, Remove}, roundtrip(Remove)).
+
+%% Total on the field names, which is the whole point: the encoder runs inside the
+%% zone's tick, so anything it cannot express has to come back as a value rather
+%% than as an exception.
+non_textual_field_names_refuse_the_frame_test() ->
+    Numeric = frame([#{op => update, slot => 1, gen => 0, fields => #{1 => 1.0}}]),
+    ?assertEqual({error, bad_field_name}, asobi_wire:encode(Numeric)),
+    Tuple = frame([#{op => update, slot => 1, gen => 0, fields => #{{a, b} => 1.0}}]),
+    ?assertEqual({error, bad_field_name}, asobi_wire:encode(Tuple)).
+
+%% Keeping one of two keys that normalise to the same name would put a value on
+%% the binary wire that the text wire does not carry, which is the disagreement
+%% the whole-frame fallback exists to prevent.
+colliding_field_names_refuse_the_frame_test() ->
+    F = frame([#{op => update, slot => 1, gen => 0, fields => #{type => 1, ~"type" => 2}}]),
+    ?assertEqual({error, ambiguous_field_name}, asobi_wire:encode(F)).
+
 %% The leave-removal frame carries no position in the zone's stream - on the text
 %% wire that is said by omitting frame_seq, which a fixed-layout binary frame
 %% cannot do. If the kind byte did not survive, that frame would decode as

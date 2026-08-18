@@ -79,8 +79,10 @@ you write `sys.config` instead.
 | `ASOBI_DB_PASSWORD` | `postgres` | Database password |
 | `ASOBI_DB_SOCKET_OPTS` | `inet` | Erlang term fragment spliced into kura's `socket_options` list. `inet`, `inet6`, `inet, {nodelay, true}`. Set `inet6` for IPv6-only Postgres networks |
 | `ASOBI_CORS_ORIGINS` | none | Allowed CORS origin. Effectively required for any browser client: unset renders an empty `Access-Control-Allow-Origin`, which no browser accepts |
-| `ASOBI_NODE_HOST` | `127.0.0.1` | Erlang node hostname, in `-name asobi@...`. Not a bind address |
-| `ERLANG_COOKIE` | `asobi` | Erlang distribution cookie. The default is the literal string `asobi` |
+| `ASOBI_NODE_HOST` | `127.0.0.1` | Erlang node hostname, in `-name ${ASOBI_NODE_NAME}@...`. Not a bind address |
+| `ASOBI_NODE_NAME` | `asobi` | Erlang node base name. Change it only to run a second asobi node in the same network namespace - the datagram gateway is the one case. **Every node in a cluster must use the same value**: `asobi_cluster` builds its peers by reusing the current node's base name |
+| `ERLANG_COOKIE` | `asobi` | Erlang distribution cookie. The default is the literal string `asobi`, so it is public. Two nodes sharing a network namespace share an EPMD, so the engine and the datagram gateway must be given **different** cookies |
+| `ASOBI_BINARY_WIRE` | off | `1` / `true` turns on the binary `world.tick` for clients that ask for it. Required by the [datagram plane](datagram-plane.md), which cannot bind a slot without it |
 
 The database port is **not** a variable. It is fixed at `5432` in the image's
 `sys.config`, so a Postgres on another port means supplying your own.
@@ -424,8 +426,26 @@ cheaper to decode - the numbers and the encoding are in
 {binary_wire, true}
 ```
 
+or, from a container:
+
+```
+ASOBI_BINARY_WIRE=1
+```
+
 A zone reads this once when it starts, so an already-running world keeps the
 setting it started with.
+
+**The [datagram plane](datagram-plane.md) requires it.** A pose datagram carries
+a slot and nothing else, and the only frame that binds a slot to an entity is an
+`add` on this wire - which `session.connect` refuses to hand any client while
+this is off. asobi logs `dgram_pose_without_binary_wire` at boot and disables
+poses rather than sending datagrams every client would discard.
+
+**A frame carries at most 32 distinct field names**, because the field header
+indexes the dictionary in five bits. Past that the frame is sent as text, which
+is correct but costs the entities in it their datagram fast path - see
+[the protocol guide](websocket-protocol.md#binary-worldtick) for what to watch
+for.
 
 What it costs while on: a zone can have subscribers on both wires, so it builds
 two buffers per broadcast instead of one. That is two encodes per zone per tick

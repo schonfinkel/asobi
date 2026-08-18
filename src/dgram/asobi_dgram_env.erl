@@ -30,6 +30,9 @@ the path wrong must not come up quietly with no authentication on its link.
 -include_lib("kernel/include/logger.hrl").
 
 -export([apply/0]).
+-ifdef(TEST).
+-export([check_pose_carrier/0]).
+-endif.
 
 -doc "Reads the environment into the application env. Idempotent.".
 -spec apply() -> ok.
@@ -39,7 +42,9 @@ apply() ->
     set_link_secret(),
     set_engine_link(),
     set_endpoint(),
+    set_binary_wire(),
     set_pose(),
+    _ = check_pose_carrier(),
     ok.
 
 %% --- Internal ---
@@ -130,6 +135,60 @@ set_endpoint() ->
     case application:get_env(asobi, dgram_endpoint) of
         {ok, _} -> ok;
         undefined -> set_binary(dgram_endpoint, "ASOBI_DGRAM_ENDPOINT")
+    end.
+
+%% Not a datagram variable, and here anyway: the datagram plane cannot work
+%% without it, and until this existed there was no way to turn the binary wire on
+%% from the published image at all - which made the whole plane unreachable for
+%% exactly the audience that configures asobi with environment variables.
+set_binary_wire() ->
+    case {application:get_env(asobi, binary_wire), os:getenv("ASOBI_BINARY_WIRE")} of
+        {undefined, Value} when Value =:= "1"; Value =:= "true" ->
+            application:set_env(asobi, binary_wire, true);
+        {undefined, Value} when Value =:= "0"; Value =:= "false" ->
+            application:set_env(asobi, binary_wire, false);
+        {undefined, Value} when is_list(Value), Value =/= "" ->
+            %% Said rather than swallowed, like every other malformed value in
+            %% this module. `ASOBI_BINARY_WIRE=yes` otherwise leaves the wire off
+            %% and the operator is then told to set the variable they did set.
+            ?LOG_ERROR(#{
+                msg => ~"binary_wire_malformed",
+                detail => ~"expected 1, true, 0 or false",
+                value => list_to_binary(Value)
+            });
+        _ ->
+            ok
+    end.
+
+%% A pose manifest with the binary wire off configures a plane that can never
+%% deliver anything (`asobi_dgram_pose:manifest/0` has the why). Said once at boot
+%% rather than left to be found from a game that looks like it has no other
+%% players (asobi#509).
+-spec check_pose_carrier() -> ok | {error, no_binary_wire}.
+%% Engine only. The gateway carries the same manifest so the two roles cannot
+%% disagree about it, and never encodes a frame, so the carrier rule is not its
+%% business - reporting it there would put an error in every gateway's boot log
+%% for the configuration the guides themselves recommend, which is how a boot
+%% error stops being read.
+check_pose_carrier() ->
+    case asobi_dgram_gw_sup:enabled() of
+        true -> ok;
+        false -> check_engine_pose_carrier()
+    end.
+
+-spec check_engine_pose_carrier() -> ok | {error, no_binary_wire}.
+check_engine_pose_carrier() ->
+    case {application:get_env(asobi, dgram_pose), application:get_env(asobi, binary_wire, false)} of
+        {{ok, _Manifest}, true} ->
+            ok;
+        {{ok, _Manifest}, _Off} ->
+            ?LOG_ERROR(#{
+                msg => ~"dgram_pose_without_binary_wire",
+                detail => ~"the pose plane needs asobi.binary_wire (ASOBI_BINARY_WIRE=1)"
+            }),
+            {error, no_binary_wire};
+        _ ->
+            ok
     end.
 
 %% `x:100,y:100,vx:100,vy:100` - name and scale, in canonical order. Terse
