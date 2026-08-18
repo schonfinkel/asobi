@@ -302,6 +302,138 @@ A rejected request gets `403 client_gate_denied`, with the gate's own reason in
 runs after the rate limiter, so a flood is shed by the cheap in-memory check
 before it reaches an external verification service.
 
+## The datagram gateway role
+
+One image, two roles. `role` defaults to `engine` and gives you exactly what you
+have today; `dgram_gw` starts the datagram gateway **and nothing else**.
+
+```erlang
+{role, dgram_gw},
+{dgram, #{port => 7777, shards => 4}}
+```
+
+Run them as two containers from the same image. That separation is the point
+rather than a deployment convenience: the gateway binds a UDP port and parses
+packets from anyone on the internet, and it must not share a process tree with
+the Lua sandbox or your database credentials. In the `dgram_gw` role no zone, no
+world, no match, no Lua VM and no database pool is ever started.
+
+`shards` is the number of `SO_REUSEPORT` receiver sockets and defaults to the
+scheduler count capped at 8. **It is fixed at boot.** Adding or removing a socket
+reshuffles the kernel's hash and breaks every flow already running through the
+gateway, so there is no reload path and changing it is a restart with a
+reconnect for every player on the plane.
+
+### The engine side
+
+The engine dials the gateway; the gateway never dials the engine. So the engine
+needs to know where it is, and both ends need the same secret:
+
+```erlang
+%% On the engine
+{dgram_gateway, #{host => {127, 0, 0, 1}, port => 7778}},
+{dgram_link_secret, <<"...">>},
+{dgram_endpoint, ~"udp.example.com:7777"},
+
+%% On the gateway
+{role, dgram_gw},
+{dgram, #{port => 7777, link_port => 7778, shards => 4}},
+{dgram_link_secret, <<"...">>}
+```
+
+`dgram_gateway` is the opt-in. Without it the engine dials nothing, mints nothing
+and answers `datagram_unavailable` to any client that asks - which is a normal
+answer, not an error.
+
+`dgram_endpoint` is what a client is told to send to, handed over in the mint
+response. Putting it there rather than having the client resolve it is what makes
+the plane independent of DNS and of SNI, and why a non-standard port costs the
+client nothing.
+
+**The link is loopback-only and is not encrypted.** It carries mint secrets, so
+it binds `127.0.0.1` and refuses to be told otherwise. Two containers sharing a
+network namespace is the shape it is built for; separate hosts need a tunnel, and
+that is an operator decision rather than something to default.
+
+Deliberately **not** distributed Erlang, which would have been the obvious answer
+and is the wrong one: dist is all-or-nothing, so a node that can reach another can
+call any function in it. Handing that to the process parsing packets from the
+internet gives back most of what the two-role split is for.
+
+### Describing your transform fields
+
+Nothing is sent on the plane until you say what a position *is*. There is no
+default and that is deliberate: guessing `x` and `y` at some scale would silently
+pick a precision for a world that might be a thousand times larger.
+
+```erlang
+{dgram_pose, #{
+    period_ticks => 20,
+    fields => [
+        #{name => ~"x",  scale => 100},
+        #{name => ~"y",  scale => 100},
+        #{name => ~"vx", scale => 100},
+        #{name => ~"vy", scale => 100}
+    ]
+}}
+```
+
+The list is the canonical order, so a client decodes a fixed layout and the wire
+carries no field names at all. **At most eight fields** - the per-record bitmask
+is one byte - and a ninth disables the plane rather than dropping a field
+silently.
+
+`scale` converts to the `int16` the wire carries: `100` gives two decimal places
+and a range of about +/-327 world units. A bigger world needs a smaller scale and
+coarser steps, which is a trade only your game can make. **A value outside the
+range saturates and is counted** on `asobi.dgram.pose_saturated`, never wrapped -
+wrapping would teleport an entity across the world, which looks like a game bug,
+where saturation looks like what it is.
+
+`period_ticks` is the axial refresh. An entity that stops moving stops being
+mentioned, so a client that missed its last update would keep it wrong forever;
+each tick additionally re-sends every entity whose slot falls in that tick's
+slice, so at 20 ticks nothing is stale for more than a second. It costs no acks,
+no per-client state and no extra encode.
+
+Only these fields travel on the plane. Everything else about an entity -
+including its creation and removal - rides `world.tick` on the WebSocket, where
+it is ordered and cannot be lost.
+
+### Clients ask for it over the WebSocket
+
+A client mints with `rpc.call` on the method `asobi.datagram.open`, which is a
+frame every SDK already implements, so the datagram plane adds **zero** frame
+types to the JSON wire. The reply carries `conn_id`, `kup`, `epoch`, `endpoint`
+and `expires_in`.
+
+The plane is optional in every state: the WebSocket carries everything
+throughout, and a client that never reaches the gateway is degraded rather than
+broken. See [ADR 0013](https://github.com/widgrensit/asobi/blob/main/docs/adr/0013-binary-wire-and-single-node-datagrams.md).
+
+## Binary `world.tick`
+
+Off by default. Turning it on lets a client ask for `world.tick` as a binary
+frame at `session.connect`, roughly a fifth of the bytes and several times
+cheaper to decode - the numbers and the encoding are in
+[the protocol guide](websocket-protocol.md#binary-worldtick).
+
+```erlang
+{binary_wire, true}
+```
+
+A zone reads this once when it starts, so an already-running world keeps the
+setting it started with.
+
+What it costs while on: a zone can have subscribers on both wires, so it builds
+two buffers per broadcast instead of one. That is two encodes per zone per tick
+rather than one per subscriber, and it is paid whether or not anyone has
+negotiated binary. Measured at roughly 50 us per zone per broadcast tick against
+a 50 ms budget.
+
+Clients that never ask see exactly what they saw before, so turning it on is
+safe for a live deployment. Leave it off if no client in your game asks for it.
+
 ## WebSocket origin allowlist
 
 By default the `/ws` upgrade accepts any `Origin`: web builds are served from

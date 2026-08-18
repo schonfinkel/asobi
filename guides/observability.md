@@ -109,7 +109,7 @@ both are the kind of thing that is otherwise noticed a day later.
 
 ## The events
 
-Forty, grouped by what they are about. Measurement and metadata keys
+Fifty-two, grouped by what they are about. Measurement and metadata keys
 are in `m:asobi_telemetry`, which is also the list `asobi_telemetry:events/0`
 returns - attach to that rather than restating the names.
 
@@ -121,7 +121,62 @@ asobi.ws.connected               asobi.ws.disconnected
 asobi.ws.message_in              asobi.ws.message_out
 asobi.ws.connect_rate_limited    asobi.ws.idle_auth_timeout
 asobi.ws.origin_rejected         asobi.ws.legacy_input_unwrap
+asobi.dgram.bindings_expired     asobi.dgram.dropped
+asobi.dgram.send_failed          asobi.dgram.recv_failed
+asobi.dgram.input_undelivered    asobi.dgram.input_unknown
+asobi.dgram.input_undecodable    asobi.dgram.canary_missed
+asobi.dgram.link_up              asobi.dgram.link_closed
+asobi.dgram.link_error           asobi.dgram.pose_saturated
 ```
+
+The `asobi.dgram.*` events fire only on a node in the
+[`dgram_gw` role](configuration.md#the-datagram-gateway-role).
+
+`asobi.dgram.dropped` is the one to build a dashboard on, and `gate` is why it is
+one event rather than seven. Nothing is ever sent back to a rejected datagram, so
+this counter is the only evidence a rejection happened at all.
+
+| `gate` rising | What it means |
+| --- | --- |
+| `parse` alone | Someone is pointing a scanner at the port. Uninteresting. |
+| `parse` + `ingress_global` | A volumetric flood. The global tier is doing its job. |
+| `unknown_conn` | Guessing at `conn_id`s, which is a 32-bit space. |
+| `mac` | **Wake up.** Someone has a live `conn_id` and not the key. |
+| `ingress` / `input` | One connection over its budget: a broken client, usually. |
+| `binding` | Replays or a flapping path. Check `reason`. |
+
+`asobi.dgram.canary_missed` carries `consecutive`, and that is the field to alert
+on: one miss is a scheduler hiccup, two in a row means the receive loop is wedged
+and the node stops reporting ready. It is the only signal that separates a wedged
+loop from a quiet port, which look identical from outside. Note what it does not
+cover: `SO_REUSEPORT` means the kernel chooses which shard receives the probe, so
+a healthy canary proves **at least one** shard is alive, not all of them. A single
+wedged shard shows up as a fraction of players timing out, and the place to catch
+that is `asobi.dgram.recv_failed` plus client-side telemetry.
+
+`asobi.dgram.pose_saturated` counts transform values that did not fit their
+configured scale. Any sustained rate means the `scale` in
+[`dgram_pose`](configuration.md#describing-your-transform-fields) is wrong for
+this game's world size, and the fix is configuration rather than code.
+
+`asobi.dgram.link_error` with `reason = bad_auth` is worth an alert. The engine
+link is loopback-only, so a failed authentication is either a misconfigured
+`dgram_link_secret` or something local that should not be talking to it.
+
+`asobi.dgram.link_closed` on its own is not an outage: bindings already in the
+table keep working, so players stay on the plane while the engine restarts. What
+stops is new mints and revocations, and an undeliverable revocation is bounded by
+the mint's own expiry.
+
+`asobi.dgram.input_unknown` is expected in small numbers around a session ending,
+because the two ends revoke asynchronously. Sustained, it means the gateway
+believes in a binding the engine has forgotten.
+
+`asobi.dgram.bindings_expired` fires once per sweep, counting datagram
+credentials that were minted and never used. A rising count is
+a client-side fault rather than an attack - minting costs an authenticated
+WebSocket, so this is clients opening the plane and walking away, not anyone
+getting something for free.
 
 `asobi.ws.origin_rejected` and `asobi.ws.connect_rate_limited` are the two
 worth alerting on: a spike in either is either an attack or a client
